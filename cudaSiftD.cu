@@ -189,6 +189,7 @@ __global__ void ScaleUp(float *d_Result, float *d_Data, int width, int pitch, in
   }
 }
 
+#if 0
 __global__ void ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftPoint *d_sift, int fstPts, float subsampling)
 {
   __shared__ float gauss[16];
@@ -291,6 +292,7 @@ __global__ void ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftPoint *d_
     d_sift[bx].scale *= subsampling;
   }
 }
+#endif
 
 __device__ float FastAtan2(float y, float x)
 {
@@ -304,12 +306,123 @@ __device__ float FastAtan2(float y, float x)
   r = (y<0 ? -r : r);
   return r;
 }
-       
-__global__ void ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftPoint *d_sift, float subsampling, int octave)
-{
+
+__device__ void normalize(float *buffer, float *desc, int idx,
+                          const DescriptorNormalizerData *data) {
+  // Normalize twice and suppress peaks first time
+  __shared__ float sums[4];
+  int type = 0;
+#if 0
+  switch (type) {
+  case 0: // vanilla cudasift
+  {
+    float sum = buffer[idx] * buffer[idx];
+    for (int i = 16; i > 0; i /= 2)
+      sum += ShiftDown(sum, i);
+    if ((idx & 31) == 0)
+      sums[idx / 32] = sum;
+    __syncthreads();
+    float tsum1 = sums[0] + sums[1] + sums[2] + sums[3];
+    tsum1 = min(buffer[idx] * rsqrtf(tsum1), 0.2f);
+
+    sum = tsum1 * tsum1;
+    for (int i = 16; i > 0; i /= 2)
+      sum += ShiftDown(sum, i);
+    if ((idx & 31) == 0)
+      sums[idx / 32] = sum;
+    __syncthreads();
+
+    float tsum2 = sums[0] + sums[1] + sums[2] + sums[3];
+    desc[idx] = tsum1 * rsqrtf(tsum2);
+  } break;
+  case 1: // vanilla l2
+  {
+    float sum = buffer[idx] * buffer[idx];
+    for (int i = 16; i > 0; i /= 2)
+      sum += ShiftDown(sum, i);
+    if ((idx & 31) == 0)
+      sums[idx / 32] = sum;
+    __syncthreads();
+    float tsum1 = sums[0] + sums[1] + sums[2] + sums[3];
+    desc[idx] = buffer[idx] * rsqrtf(tsum1);
+  } break;
+  case 2: // vanilla l1->l2 (note: HoG entry is always >= 0)
+  {
+    float sum = abs(buffer[idx]);
+    for (int i = 16; i > 0; i /= 2)
+      sum += ShiftDown(sum, i);
+    if ((idx & 31) == 0)
+      sums[idx / 32] = sum;
+    __syncthreads();
+    float tsum1 = sums[0] + sums[1] + sums[2] + sums[3];
+    desc[idx] = sqrtf(buffer[idx] / tsum1);
+  } break;
+  }
+#else
+  float accumulator = -1.f;
+  int offset = 0;
+  for (int i = 0; i < data->n_steps; ++i) {
+    switch (data->normalizer_steps[i]) {
+    case 0: {
+      desc[idx] = buffer[idx];
+    }
+    case 1: {
+      float sum = buffer[idx] * buffer[idx];
+      for (int i = 16; i > 0; i /= 2)
+        sum += ShiftDown(sum, i);
+      if ((idx & 31) == 0)
+        sums[idx / 32] = sum;
+      __syncthreads();
+      accumulator = sqrtf(sums[0] + sums[1] + sums[2] + sums[3]);
+    } break;
+    case 2: {
+      float sum = abs(buffer[idx]);
+      for (int i = 16; i > 0; i /= 2)
+        sum += ShiftDown(sum, i);
+      if ((idx & 31) == 0)
+        sums[idx / 32] = sum;
+      __syncthreads();
+      accumulator = sums[0] + sums[1] + sums[2] + sums[3];
+    } break;
+    case 3: {
+      buffer[idx] = buffer[idx] / accumulator;
+      __syncthreads();
+    } break;
+    case 4: {
+      const float alpha = data->data[offset++];
+      const float threshold = alpha * accumulator;
+      const float v = buffer[idx];
+      buffer[idx] = v >= 0.f ? (v > threshold ? threshold : v)
+                             : (v < -threshold ? -threshold : v);
+    } break;
+    case 5: {
+      buffer[idx] = buffer[idx] + data->data[offset + idx];
+      offset += 128;
+    } break;
+    case 6: {
+      float acc = 0.f;
+      for (int i = 0; i < 128; ++i)
+        acc += data->data[offset + idx * 128 + i] * buffer[i];
+      __syncthreads();
+      buffer[idx] = acc;
+    } break;
+    case 7: {
+      const float v = buffer[idx];
+      buffer[idx] = v < 0.f ? -sqrtf(-v) : sqrtf(v);
+    } break;
+    }
+  }
+
+#endif
+  __syncthreads();
+}
+
+__global__ void
+ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftPoint *d_sift,
+                               const DescriptorNormalizerData *normalizer_d,
+                               float subsampling, int octave) {
   __shared__ float gauss[16];
   __shared__ float buffer[128];
-  __shared__ float sums[4];
 
   const int tx = threadIdx.x; // 0 -> 16
   const int ty = threadIdx.y; // 0 -> 8
@@ -386,28 +499,8 @@ __global__ void ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftP
       }
     }
     __syncthreads();
-    
-    // Normalize twice and suppress peaks first time
-    float sum = buffer[idx]*buffer[idx];
-    for (int i=16;i>0;i/=2)
-      sum += ShiftDown(sum, i);
-    if ((idx&31)==0)
-      sums[idx/32] = sum;
-    __syncthreads();
-    float tsum1 = sums[0] + sums[1] + sums[2] + sums[3]; 
-    tsum1 = min(buffer[idx] * rsqrtf(tsum1), 0.2f);
-     
-    sum = tsum1*tsum1; 
-    for (int i=16;i>0;i/=2)
-      sum += ShiftDown(sum, i);
-    if ((idx&31)==0)
-      sums[idx/32] = sum;
-    __syncthreads();
-    
-    float tsum2 = sums[0] + sums[1] + sums[2] + sums[3];
-    float *desc = d_sift[bx].data;
-    desc[idx] = tsum1 * rsqrtf(tsum2);
-    if (idx==0) {
+    normalize(buffer, d_sift[bx].data, idx, normalizer_d);
+    if (idx == 0) {
       d_sift[bx].xpos *= subsampling;
       d_sift[bx].ypos *= subsampling;
       d_sift[bx].scale *= subsampling;
@@ -415,16 +508,17 @@ __global__ void ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftP
     __syncthreads();
   }
 }
- 
 
-__global__ void ExtractSiftDescriptorsCONST(cudaTextureObject_t texObj, SiftPoint *d_sift, float subsampling, int octave)
-{
+__global__ void
+ExtractSiftDescriptorsCONST(cudaTextureObject_t texObj, SiftPoint *d_sift,
+                            const DescriptorNormalizerData *d_normalizer,
+                            float subsampling, int octave) {
   __shared__ float gauss[16];
   __shared__ float buffer[128];
-  __shared__ float sums[4];
 
   const int tx = threadIdx.x; // 0 -> 16
   const int ty = threadIdx.y; // 0 -> 8
+  // descriptor component
   const int idx = ty*16 + tx;
   if (ty==0)
     gauss[tx] = exp(-(tx-7.5f)*(tx-7.5f)/128.0f);
@@ -498,27 +592,7 @@ __global__ void ExtractSiftDescriptorsCONST(cudaTextureObject_t texObj, SiftPoin
       }
     }
     __syncthreads();
-    
-    // Normalize twice and suppress peaks first time
-    float sum = buffer[idx]*buffer[idx];
-    for (int i=16;i>0;i/=2)
-      sum += ShiftDown(sum, i);
-    if ((idx&31)==0)
-      sums[idx/32] = sum;
-    __syncthreads();
-    float tsum1 = sums[0] + sums[1] + sums[2] + sums[3]; 
-    tsum1 = min(buffer[idx] * rsqrtf(tsum1), 0.2f);
-     
-    sum = tsum1*tsum1; 
-    for (int i=16;i>0;i/=2)
-      sum += ShiftDown(sum, i);
-    if ((idx&31)==0)
-      sums[idx/32] = sum;
-    __syncthreads();
-    
-    float tsum2 = sums[0] + sums[1] + sums[2] + sums[3];
-    float *desc = d_sift[bx].data;
-    desc[idx] = tsum1 * rsqrtf(tsum2);
+    normalize(buffer, d_sift[bx].data, idx, d_normalizer);
     if (idx==0) {
       d_sift[bx].xpos *= subsampling;
       d_sift[bx].ypos *= subsampling;
@@ -527,7 +601,6 @@ __global__ void ExtractSiftDescriptorsCONST(cudaTextureObject_t texObj, SiftPoin
     __syncthreads();
   }
 }
- 
 
 __global__ void ExtractSiftDescriptorsOld(cudaTextureObject_t texObj, SiftPoint *d_sift, int fstPts, float subsampling)
 {

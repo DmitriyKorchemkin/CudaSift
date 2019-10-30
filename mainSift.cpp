@@ -59,13 +59,23 @@ int main(int argc, char **argv)
   float thresh = (imgSet ? 4.5f : 3.0f);
   InitSiftData(siftData1, 32768, true, true); 
   InitSiftData(siftData2, 32768, true, true);
-  
+
+  DescriptorNormalizerData data;
+  data.n_steps = 5;
+  data.n_data = 1;
+  int steps[] = {1, 4, 1, 3, 0};
+  float dataf[] = {0.2f};
+  data.normalizer_steps = steps;
+  data.data = dataf;
+
   // A bit of benchmarking 
   //for (int thresh1=1.00f;thresh1<=4.01f;thresh1+=0.50f) {
   float *memoryTmp = AllocSiftTempMemory(w, h, 5, false);
     for (int i=0;i<1000;i++) {
-      ExtractSift(siftData1, img1, 5, initBlur, thresh, 0.0f, false, memoryTmp);
-      ExtractSift(siftData2, img2, 5, initBlur, thresh, 0.0f, false, memoryTmp);
+      ExtractSift(siftData1, img1, 5, initBlur, thresh, data, 0.0f, false,
+                  memoryTmp);
+      ExtractSift(siftData2, img2, 5, initBlur, thresh, data, 0.0f, false,
+                  memoryTmp);
     }
     FreeSiftTempMemory(memoryTmp);
     
@@ -74,9 +84,10 @@ int main(int argc, char **argv)
       MatchSiftData(siftData1, siftData2);
     float homography[9];
     int numMatches;
-    FindHomography(siftData1, homography, &numMatches, 10000, 0.00f, 0.80f, 5.0);
-    int numFit = ImproveHomography(siftData1, homography, 5, 0.00f, 0.80f, 3.0);
-    
+    FindHomography(siftData1, homography, &numMatches, 10000, 0.00f, 0.95f,
+                   5.0);
+    int numFit = ImproveHomography(siftData1, homography, 5, 0.00f, 0.95f, 3.0);
+
     std::cout << "Number of original features: " <<  siftData1.numPts << " " << siftData2.numPts << std::endl;
     std::cout << "Number of matching features: " << numFit << " " << numMatches << " " << 100.0f*numFit/std::min(siftData1.numPts, siftData2.numPts) << "% " << initBlur << " " << thresh << std::endl;
     //}
