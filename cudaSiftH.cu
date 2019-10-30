@@ -15,6 +15,7 @@
 #include "cudaSiftH.h"
 
 #include "cudaSiftD.cu"
+#define VERBOSE
 
 void InitCuda(int devNum)
 {
@@ -69,8 +70,10 @@ void FreeSiftTempMemory(float *memoryTmp)
     safeCall(cudaFree(memoryTmp));
 }
 
-void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double initBlur, float thresh, float lowestScale, bool scaleUp, float *tempMemory) 
-{
+void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
+                 double initBlur, float thresh,
+                 const DescriptorNormalizerData &normalizer_h,
+                 float lowestScale, bool scaleUp, float *tempMemory) {
   TimerGPU timer(0);
   unsigned int *d_PointCounterAddr;
   safeCall(cudaGetSymbolAddress((void**)&d_PointCounterAddr, d_PointCounter));
@@ -103,6 +106,25 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
   }
   float *memorySub = memoryTmp + sizeTmp;
 
+  DescriptorNormalizerData *p_normalizer_d;
+  int sz = sizeof(DescriptorNormalizerData) +
+           normalizer_h.n_steps * sizeof(int) +
+           normalizer_h.n_data * sizeof(float);
+  DescriptorNormalizerData normalizer_d;
+  normalizer_d.n_steps = normalizer_h.n_steps;
+  normalizer_d.n_data = normalizer_h.n_data;
+  safeCall(cudaMalloc((void **)&p_normalizer_d, sz));
+  normalizer_d.normalizer_steps = (int *)(void *)(p_normalizer_d + 1);
+  normalizer_d.data =
+      ((float *)((int *)(void *)(p_normalizer_d + 1) + normalizer_d.n_steps));
+  cudaMemcpy(p_normalizer_d, &normalizer_d, sizeof(DescriptorNormalizerData),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(normalizer_d.normalizer_steps, normalizer_h.normalizer_steps,
+             sizeof(int) * normalizer_h.n_steps, cudaMemcpyHostToDevice);
+  cudaMemcpy(normalizer_d.data, normalizer_h.data,
+             sizeof(float) * normalizer_h.n_data, cudaMemcpyHostToDevice);
+  checkMsg("Normalizer allocation failed\n");
+
   CudaImage lowImg;
   lowImg.Allocate(width, height, iAlignUp(width, 128), false, memorySub);
   if (!scaleUp) {
@@ -111,7 +133,9 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     safeCall(cudaMemcpyToSymbolAsync(d_LaplaceKernel, kernel, 8*12*16*sizeof(float)));
     LowPass(lowImg, img, max(initBlur, 0.001f));
     TimerGPU timer1(0);
-    ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh, lowestScale, 1.0f, memoryTmp, memorySub + height*iAlignUp(width, 128));
+    ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh, lowestScale,
+                    p_normalizer_d, 1.0f, memoryTmp,
+                    memorySub + height * iAlignUp(width, 128));
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
     printf("SIFT extraction time =        %.2f ms %d\n", timer1.read(), siftData.numPts);
@@ -124,7 +148,9 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
     float kernel[8*12*16];
     PrepareLaplaceKernels(numOctaves, 0.0f, kernel);
     safeCall(cudaMemcpyToSymbolAsync(d_LaplaceKernel, kernel, 8*12*16*sizeof(float)));
-    ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh, lowestScale*2.0f, 1.0f, memoryTmp, memorySub + height*iAlignUp(width, 128));
+    ExtractSiftLoop(siftData, lowImg, numOctaves, 0.0f, thresh,
+                    lowestScale * 2.0f, p_normalizer_d, 1.0f, memoryTmp,
+                    memorySub + height * iAlignUp(width, 128));
     safeCall(cudaMemcpy(&siftData.numPts, &d_PointCounterAddr[2*numOctaves], sizeof(int), cudaMemcpyDeviceToHost)); 
     siftData.numPts = (siftData.numPts<siftData.maxPts ? siftData.numPts : siftData.maxPts);
     RescalePositions(siftData, 0.5f);
@@ -139,12 +165,15 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves, double init
   if (siftData.h_data)
     safeCall(cudaMemcpy(siftData.h_data, siftData.d_data, sizeof(SiftPoint)*siftData.numPts, cudaMemcpyDeviceToHost));
 #endif
+  safeCall(cudaFree(p_normalizer_d));
   double totTime = timer.read();
   printf("Incl prefiltering & memcpy =  %.2f ms %d\n\n", totTime, siftData.numPts);
 }
 
-int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves, double initBlur, float thresh, float lowestScale, float subsampling, float *memoryTmp, float *memorySub) 
-{
+int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves,
+                    double initBlur, float thresh, float lowestScale,
+                    const DescriptorNormalizerData *normalizer_d,
+                    float subsampling, float *memoryTmp, float *memorySub) {
 #ifdef VERBOSE
   TimerGPU timer(0);
 #endif
@@ -156,9 +185,12 @@ int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves, double i
     subImg.Allocate(w/2, h/2, p, false, memorySub); 
     ScaleDown(subImg, img, 0.5f);
     float totInitBlur = (float)sqrt(initBlur*initBlur + 0.5f*0.5f) / 2.0f;
-    ExtractSiftLoop(siftData, subImg, numOctaves-1, totInitBlur, thresh, lowestScale, subsampling*2.0f, memoryTmp, memorySub + (h/2)*p);
+    ExtractSiftLoop(siftData, subImg, numOctaves - 1, totInitBlur, thresh,
+                    lowestScale, normalizer_d, subsampling * 2.0f, memoryTmp,
+                    memorySub + (h / 2) * p);
   }
-  ExtractSiftOctave(siftData, img, numOctaves, thresh, lowestScale, subsampling, memoryTmp);
+  ExtractSiftOctave(siftData, img, numOctaves, thresh, lowestScale,
+                    normalizer_d, subsampling, memoryTmp);
 #ifdef VERBOSE
   double totTime = timer.read();
   printf("ExtractSift time total =      %.2f ms %d\n\n", totTime, numOctaves);
@@ -166,8 +198,10 @@ int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves, double i
   return 0;
 }
 
-void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave, float thresh, float lowestScale, float subsampling, float *memoryTmp)
-{
+void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave,
+                       float thresh, float lowestScale,
+                       const DescriptorNormalizerData *normalizer_d,
+                       float subsampling, float *memoryTmp) {
   const int nd = NUM_SCALES + 3;
 #ifdef VERBOSE
   unsigned int *d_PointCounterAddr;
@@ -215,8 +249,8 @@ void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave, float thr
   double gpuTimeDoG = timer1.read();
   TimerGPU timer4;
 #endif
-  ComputeOrientations(texObj, img, siftData, octave); 
-  ExtractSiftDescriptors(texObj, siftData, subsampling, octave); 
+  ComputeOrientations(texObj, img, siftData, octave);
+  ExtractSiftDescriptors(texObj, siftData, normalizer_d, subsampling, octave);
   //OrientAndExtract(texObj, siftData, subsampling, octave); 
   
   safeCall(cudaDestroyTextureObject(texObj));
@@ -368,17 +402,20 @@ double ComputeOrientations(cudaTextureObject_t texObj, CudaImage &src, SiftData 
   return 0.0;
 }
 
-double ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftData &siftData, float subsampling, int octave)
-{
+double ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftData &siftData,
+                              const DescriptorNormalizerData *normalizer_d,
+                              float subsampling, int octave) {
   dim3 blocks(512); 
   dim3 threads(16, 8);
 #ifdef MANAGEDMEM
-  ExtractSiftDescriptorsCONST<<<blocks, threads>>>(texObj, siftData.m_data, subsampling, octave);
+  ExtractSiftDescriptorsCONST<<<blocks, threads>>>(
+      texObj, siftData.m_data, normalizer_d, subsampling, octave);
 #else
-  ExtractSiftDescriptorsCONSTNew<<<blocks, threads>>>(texObj, siftData.d_data, subsampling, octave);
+  ExtractSiftDescriptorsCONSTNew<<<blocks, threads>>>(
+      texObj, siftData.d_data, normalizer_d, subsampling, octave);
 #endif
   checkMsg("ExtractSiftDescriptors() execution failed\n");
-  return 0.0; 
+  return 0.0;
 }
 
 double OrientAndExtract(cudaTextureObject_t texObj, SiftData &siftData, float subsampling, int octave)
