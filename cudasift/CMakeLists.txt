@@ -5,6 +5,7 @@ set(SOURCE_FILES
     src/cudaImage.cu
     src/cudaSiftH.cu
     src/matching.cu
+    src/SiftDetector.cpp
 	)
 set(HEADER_FILES
     include/cudasift/cudautils.h
