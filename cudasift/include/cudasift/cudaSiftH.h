@@ -22,7 +22,6 @@ double ComputeOrientations(cudaTextureObject_t texObj, CudaImage &src, SiftData 
 double ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftData &siftData,
                               const DescriptorNormalizerData *normalizer_d,
                               float subsampling, int octave);
-double OrientAndExtract(cudaTextureObject_t texObj, SiftData &siftData, float subsampling, int octave);
 double RescalePositions(SiftData &siftData, float scale);
 double LowPass(CudaImage &res, CudaImage &src, float scale);
 void PrepareLaplaceKernels(int numOctaves, float initBlur, float *kernel);
