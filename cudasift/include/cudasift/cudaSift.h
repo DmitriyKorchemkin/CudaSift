@@ -1,7 +1,10 @@
 #ifndef CUDASIFT_H
 #define CUDASIFT_H
 
+#include "cudasift/SiftDetector.hpp"
 #include "cudasift/cudaImage.h"
+#include <cstdint>
+#include <cuda_runtime_api.h>
 
 namespace cudasift {
 
@@ -35,75 +38,89 @@ typedef struct {
 
 } SiftData;
 
-enum NormalizerOp {
-  CopyToOutput,
-  ComputeL2,
-  CopmuteL1,
-  DivideByNorm,
-  Clamp,
-  Add,
-  Mul,
-  Sqrt,
-  OP_LAST
-};
-
-constexpr size_t OpDataSize(const NormalizerOp &op) {
-  if (op >= OP_LAST)
-    return ~(size_t)0;
-
-  switch (op) {
-  case Clamp:
-    return 1;
-  case Add:
-    return 128;
-  case Mul:
-    return 128 * 128;
-  default:
-    return 0;
-  }
-}
-
-typedef struct {
-  /*
-   * Possible normalizer steps:
-   *  0. forward internal buffer to output
-   *  1. compute l2 norm and cache it
-   *  2. compute l1 norm and cache it
-   *  3. divide by cached norm element-wise
-   *  4. clamp with alpha * accumulated_norm (consumes a single scalar alpha)
-   *  5. add 128-element vector (consumes 128 scalars)
-   *  6. compute matrix-vector product with 128x128 matrix (consumes
-   * 128*128=16384 scalars
-   *  7. divide by square root of absolute value element-wise
-   *
-   *  // TODO: add special handling for target cases (i.e. take positveness of
-   * HoG entries into account)
-   *
-   *  Vanilla SIFT: 1, 4 (0.2), 1, 3, 0
-   *  Vanilla RSIFT: 1, 4 (0.2), 2, 3, 0
-   *  ZCA-RSIFT 1, 4 (0.2), 2, 3,  5 (-mean), 6 (ZCA), 1, 3, 0
-   *  +RSIFT 1, 4 (0.2) 2, 3, 5 (-mean), 6 (ZCA), 2, 3, 7, 0
-   */
-  int n_steps;
-  int n_data;
-  int *normalizer_steps;
-  float *data;
-} DescriptorNormalizerData;
-
 void InitCuda(int devNum = 0);
 float *AllocSiftTempMemory(int width, int height, int numOctaves,
                            bool scaleUp = false);
 void FreeSiftTempMemory(float *memoryTmp);
-void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
-                 double initBlur, float thresh,
-                 const DescriptorNormalizerData &normalizer,
-                 float lowestScale = 0.0f, bool scaleUp = false,
-                 float *tempMemory = 0);
 void InitSiftData(SiftData &data, int num = 1024, bool host = false,
                   bool dev = true);
 void FreeSiftData(SiftData &data);
 void PrintSiftData(SiftData &data);
 double MatchSiftData(SiftData &data1, SiftData &data2);
+
+struct DetectorConfigDevice {
+  DetectorConfigDevice(int, void **);
+  ~DetectorConfigDevice();
+
+  mutable uint32_t pointCounter[8 * 2 + 1];
+  uint32_t maxNumPoints;
+
+  const float *scaleDownKernel;
+  const float *lowPassKernel;
+  const float *laplaceKernel;
+
+private:
+  DetectorConfigDevice(const DetectorConfigDevice &) = delete;
+};
+
+struct DetectorConfigHost {
+  DetectorConfigHost(int);
+  ~DetectorConfigHost();
+
+  DetectorConfigDevice *dev;
+  float oldScaleLowPass;
+  float oldVarianceScaleDown;
+
+  float *scaleDownKernel;
+  float *lowPassKernel;
+  float *laplaceKernel;
+  uint32_t *pointCounter;
+
+private:
+  DetectorConfigHost(const DetectorConfigHost &) = delete;
+};
+
+struct SiftDetectorImpl {
+  SiftDetectorImpl(const SiftParams &params = SiftParams(), int device = 0,
+                   void *stream = nullptr);
+
+  ~SiftDetectorImpl();
+  void ExtractSift(SiftData &siftData, CudaImage &img);
+
+private:
+  double ScaleDown(CudaImage &res, CudaImage &src, float variance);
+  int ExtractSiftLoop(SiftData &siftData, CudaImage &img, int numOctaves,
+                      float blur, float lowestScale, float subsampling,
+                      float *memorySub);
+
+  void ExtractSiftOctave(SiftData &siftData, CudaImage &img, int octave,
+                         float lowestScale, float subsampling);
+  double ComputeOrientations(cudaTextureObject_t texObj, CudaImage &src,
+                             SiftData &siftData, int octave);
+  double ExtractSiftDescriptors(cudaTextureObject_t texObj, SiftData &siftData,
+                                float subsampling, int octave);
+  double LaplaceMulti(cudaTextureObject_t texObj, CudaImage &baseImage,
+                      CudaImage *results, int octave);
+  double FindPointsMulti(CudaImage *sources, SiftData &siftData,
+                         float edgeLimit, float factor, float lowestScale,
+                         float subsampling, int octave);
+  double ScaleUp(CudaImage &res, CudaImage &src);
+  double RescalePositions(SiftData &siftData, float scale);
+  void PrepareLaplaceKernels(int numOctaves, float initBlur, float *kernel);
+
+  double LowPass(CudaImage &res, CudaImage &src, float scale);
+  void realloc(int h, int w);
+  SiftDetectorImpl(const SiftDetectorImpl &) = delete;
+  DetectorConfigHost configHost;
+  float *memoryTmp = nullptr;
+  int memoryAlloc = 0;
+  CudaImage scaledUp, lowImg;
+
+  SiftParams params;
+  void *stream;
+  int device;
+  DescriptorNormalizerData *p_normalizer_d;
+};
 
 } // namespace cudasift
 

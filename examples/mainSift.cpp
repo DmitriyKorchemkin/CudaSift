@@ -56,37 +56,27 @@ int main(int argc, char **argv) {
   InitSiftData(siftData1, 32768, true, true);
   InitSiftData(siftData2, 32768, true, true);
 
-  DescriptorNormalizerData data;
-  data.n_steps = 5;
-  data.n_data = 1;
-  int steps[] = {1, 4, 1, 3, 0};
-  float dataf[] = {0.2f};
-  data.normalizer_steps = steps;
-  data.data = dataf;
 
+  SiftDetectorImpl sift;
   const int N = 10000;
   std::vector<double> detect, match;
 
   // A bit of benchmarking
   // for (int thresh1=1.00f;thresh1<=4.01f;thresh1+=0.50f) {
-  float *memoryTmp = AllocSiftTempMemory(w, h, 5, false);
   for (int i = 0; i < N; i++) {
     auto start = std::chrono::high_resolution_clock::now();
-    ExtractSift(siftData1, img1, 5, initBlur, thresh, data, 0.0f, false,
-                memoryTmp);
+    sift.ExtractSift(siftData1, img1);
     auto stop1 = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff1 = stop1 - start;
     double delta;
     delta = diff1.count();
     detect.push_back(delta);
-    ExtractSift(siftData2, img2, 5, initBlur, thresh, data, 0.0f, false,
-                memoryTmp);
+    sift.ExtractSift(siftData2, img2);
     auto stop2 = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff2 = stop2 - stop1;
     delta = diff2.count();
     detect.push_back(delta);
   }
-  FreeSiftTempMemory(memoryTmp);
 
   // Match Sift features and find a homography
   for (int i = 0; i < N; i++) {

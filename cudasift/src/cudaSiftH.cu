@@ -70,45 +70,17 @@ void FreeSiftTempMemory(float *memoryTmp) {
     safeCall(cudaFree(memoryTmp));
 }
 
-void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
-                 double initBlur, float thresh,
-                 const DescriptorNormalizerData &normalizer_h,
-                 float lowestScale, bool scaleUp, float *tempMemory) {
-  DetectorConfigHost cfg(siftData.maxPts);
-  TimerGPU timer(0);
+SiftDetectorImpl::SiftDetectorImpl(const SiftParams &params, int device,
+                                   void *stream)
+    : configHost(params.nFeatures), device(device),
+      stream((cudaStream_t)stream), params(params) {
   float kernel[12 * 8 * 16];
-  PrepareLaplaceKernels(numOctaves, 0.0f, kernel);
-  safeCall(cudaMemcpy(cfg.laplaceKernel, kernel, 8 * 12 * 16 * sizeof(float),
-                      cudaMemcpyHostToDevice));
+  PrepareLaplaceKernels(params.numOctaves, 0.f, kernel);
 
-  const int nd = NUM_SCALES + 3;
-  int w = img.width * (scaleUp ? 2 : 1);
-  int h = img.height * (scaleUp ? 2 : 1);
-  int p = iAlignUp(w, 128);
-  int width = w, height = h;
-  int size = h * p;         // image sizes
-  int sizeTmp = nd * h * p; // laplace buffer sizes
-  for (int i = 0; i < numOctaves; i++) {
-    w /= 2;
-    h /= 2;
-    int p = iAlignUp(w, 128);
-    size += h * p;
-    sizeTmp += nd * h * p;
-  }
-  float *memoryTmp = tempMemory;
-  size += sizeTmp;
-  if (!tempMemory) {
-    size_t pitch;
-    safeCall(cudaMallocPitch((void **)&memoryTmp, &pitch, (size_t)4096,
-                             (size + 4095) / 4096 * sizeof(float)));
-#ifdef VERBOSE
-    printf("Allocated memory size: %d bytes\n", size);
-    printf("Memory allocation time =      %.2f ms\n\n", timer.read());
-#endif
-  }
-  float *memorySub = memoryTmp + sizeTmp;
+  safeCall(cudaMemcpy(configHost.laplaceKernel, kernel,
+                      8 * 12 * 16 * sizeof(float), cudaMemcpyHostToDevice));
 
-  DescriptorNormalizerData *p_normalizer_d;
+  const auto &normalizer_h = params.normalizer.exportNormalizer();
   int sz = sizeof(DescriptorNormalizerData) +
            normalizer_h.n_steps * sizeof(int) +
            normalizer_h.n_data * sizeof(float);
@@ -119,24 +91,65 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
   normalizer_d.normalizer_steps = (int *)(void *)(p_normalizer_d + 1);
   normalizer_d.data =
       ((float *)((int *)(void *)(p_normalizer_d + 1) + normalizer_d.n_steps));
-  cudaMemcpy(p_normalizer_d, &normalizer_d, sizeof(DescriptorNormalizerData),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(normalizer_d.normalizer_steps, normalizer_h.normalizer_steps,
-             sizeof(int) * normalizer_h.n_steps, cudaMemcpyHostToDevice);
-  cudaMemcpy(normalizer_d.data, normalizer_h.data,
-             sizeof(float) * normalizer_h.n_data, cudaMemcpyHostToDevice);
+  safeCall(cudaMemcpy(p_normalizer_d, &normalizer_d,
+                      sizeof(DescriptorNormalizerData),
+                      cudaMemcpyHostToDevice));
+  safeCall(
+      cudaMemcpy(normalizer_d.normalizer_steps, normalizer_h.normalizer_steps,
+                 sizeof(int) * normalizer_h.n_steps, cudaMemcpyHostToDevice));
+  safeCall(cudaMemcpy(normalizer_d.data, normalizer_h.data,
+                      sizeof(float) * normalizer_h.n_data,
+                      cudaMemcpyHostToDevice));
   checkMsg("Normalizer allocation failed\n");
+}
 
-  CudaImage lowImg;
+SiftDetectorImpl::~SiftDetectorImpl() {
+  FreeSiftTempMemory(memoryTmp);
+  safeCall(cudaFree(p_normalizer_d));
+}
+
+void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img) {
+  TimerGPU timer(0);
+  const int nd = NUM_SCALES + 3;
+  int w = img.width * (params.scaleUp ? 2 : 1);
+  int h = img.height * (params.scaleUp ? 2 : 1);
+  int p = iAlignUp(w, 128);
+  int width = w, height = h;
+  int size = h * p;         // image sizes
+  int sizeTmp = nd * h * p; // laplace buffer sizes
+  for (int i = 0; i < params.numOctaves; i++) {
+    w /= 2;
+    h /= 2;
+    int p = iAlignUp(w, 128);
+    size += h * p;
+    sizeTmp += nd * h * p;
+  }
+  size += sizeTmp;
+  if (!memoryTmp || memoryAlloc < size) {
+    FreeSiftTempMemory(memoryTmp);
+    size_t pitch;
+    safeCall(cudaMallocPitch((void **)&memoryTmp, &pitch, (size_t)4096,
+                             (size + 4095) / 4096 * sizeof(float)));
+    memoryAlloc = size;
+
+#if 1 // def VERBOSE
+    printf("Allocated memory size: %d bytes\n", size);
+    printf("Memory allocation time =      %.2f ms\n\n", timer.read());
+#endif
+  }
+  float *memorySub = memoryTmp + sizeTmp;
+  safeCall(
+      cudaMemset(configHost.pointCounter, 0x0, sizeof(uint32_t) * (8 * 2 + 1)));
   lowImg.Allocate(width, height, iAlignUp(width, 128), false, memorySub);
 
-  if (!scaleUp) {
-    LowPass(&cfg, lowImg, img, max(initBlur, 0.001f));
+  if (!params.scaleUp) {
+    LowPass(lowImg, img, max(params.initBlur, 0.001f));
     TimerGPU timer1(0);
-    ExtractSiftLoop(&cfg, siftData, lowImg, numOctaves, 0.0f, thresh,
-                    lowestScale, p_normalizer_d, 1.0f, memoryTmp,
+    ExtractSiftLoop(siftData, lowImg, params.numOctaves, 0.0f,
+                    params.lowestScale, 1.0f,
                     memorySub + height * iAlignUp(width, 128));
-    safeCall(cudaMemcpy(&siftData.numPts, &cfg.pointCounter[2 * numOctaves],
+    safeCall(cudaMemcpy(&siftData.numPts,
+                        &configHost.pointCounter[2 * params.numOctaves],
                         sizeof(uint32_t), cudaMemcpyDeviceToHost));
     siftData.numPts =
         (siftData.numPts < siftData.maxPts ? siftData.numPts : siftData.maxPts);
@@ -147,11 +160,12 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
     upImg.Allocate(width, height, iAlignUp(width, 128), false, memoryTmp);
     TimerGPU timer1(0);
     ScaleUp(upImg, img);
-    LowPass(&cfg, lowImg, upImg, max(initBlur, 0.001f));
-    ExtractSiftLoop(&cfg, siftData, lowImg, numOctaves, 0.0f, thresh,
-                    lowestScale * 2.0f, p_normalizer_d, 1.0f, memoryTmp,
+    LowPass(lowImg, upImg, max(params.initBlur, 0.001f));
+    ExtractSiftLoop(siftData, lowImg, params.numOctaves, 0.0f,
+                    params.lowestScale * 2.0f, 1.0f,
                     memorySub + height * iAlignUp(width, 128));
-    safeCall(cudaMemcpy(&siftData.numPts, &cfg.pointCounter[2 * numOctaves],
+    safeCall(cudaMemcpy(&siftData.numPts,
+                        &configHost.pointCounter[2 * params.numOctaves],
                         sizeof(uint32_t), cudaMemcpyDeviceToHost));
     siftData.numPts =
         (siftData.numPts < siftData.maxPts ? siftData.numPts : siftData.maxPts);
@@ -159,8 +173,6 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
     printf("SIFT extraction time =        %.2f ms\n", timer1.read());
   }
 
-  if (!tempMemory)
-    safeCall(cudaFree(memoryTmp));
 #ifdef MANAGEDMEM
   safeCall(cudaDeviceSynchronize());
 #else
@@ -169,17 +181,15 @@ void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
                         sizeof(SiftPoint) * siftData.numPts,
                         cudaMemcpyDeviceToHost));
 #endif
-  safeCall(cudaFree(p_normalizer_d));
   double totTime = timer.read();
   printf("Incl prefiltering & memcpy =  %.2f ms %d\n\n", totTime,
          siftData.numPts);
 }
 
-int ExtractSiftLoop(DetectorConfigHost *cfg, SiftData &siftData, CudaImage &img,
-                    int numOctaves, double initBlur, float thresh,
-                    float lowestScale,
-                    const DescriptorNormalizerData *normalizer_d,
-                    float subsampling, float *memoryTmp, float *memorySub) {
+int SiftDetectorImpl::ExtractSiftLoop(SiftData &siftData, CudaImage &img,
+                                      int numOctaves, float blur,
+                                      float lowestScale, float subsampling,
+                                      float *memorySub) {
 #ifdef VERBOSE
   TimerGPU timer(0);
 #endif
@@ -189,14 +199,12 @@ int ExtractSiftLoop(DetectorConfigHost *cfg, SiftData &siftData, CudaImage &img,
     CudaImage subImg;
     int p = iAlignUp(w / 2, 128);
     subImg.Allocate(w / 2, h / 2, p, false, memorySub);
-    ScaleDown(cfg, subImg, img, 0.5f);
-    float totInitBlur = (float)sqrt(initBlur * initBlur + 0.5f * 0.5f) / 2.0f;
-    ExtractSiftLoop(cfg, siftData, subImg, numOctaves - 1, totInitBlur, thresh,
-                    lowestScale, normalizer_d, subsampling * 2.0f, memoryTmp,
-                    memorySub + (h / 2) * p);
+    ScaleDown(subImg, img, 0.5f);
+    float totInitBlur = (float)sqrt(blur * blur + 0.5f * 0.5f) / 2.0f;
+    ExtractSiftLoop(siftData, subImg, numOctaves - 1, totInitBlur, lowestScale,
+                    subsampling * 2.0f, memorySub + (h / 2) * p);
   }
-  ExtractSiftOctave(cfg->dev, siftData, img, numOctaves, thresh, lowestScale,
-                    normalizer_d, subsampling, memoryTmp);
+  ExtractSiftOctave(siftData, img, numOctaves, lowestScale, subsampling);
 #ifdef VERBOSE
   double totTime = timer.read();
   printf("ExtractSift time total =      %.2f ms %d\n\n", totTime, numOctaves);
@@ -204,16 +212,14 @@ int ExtractSiftLoop(DetectorConfigHost *cfg, SiftData &siftData, CudaImage &img,
   return 0;
 }
 
-void ExtractSiftOctave(const DetectorConfigDevice *cfg, SiftData &siftData,
-                       CudaImage &img, int octave, float thresh,
-                       float lowestScale,
-                       const DescriptorNormalizerData *normalizer_d,
-                       float subsampling, float *memoryTmp) {
+void SiftDetectorImpl::ExtractSiftOctave(SiftData &siftData, CudaImage &img,
+                                         int octave, float lowestScale,
+                                         float subsampling) {
   const int nd = NUM_SCALES + 3;
 #ifdef VERBOSE
   safeCall(cudaDeviceSynchronize());
   unsigned int fstPts, totPts;
-  fstPts = cfg->pointCounter[2 * octave - 1];
+  fstPts = configHost->pointCounter[2 * octave - 1];
   TimerGPU timer0;
 #endif
   CudaImage diffImg[nd];
@@ -249,16 +255,15 @@ void ExtractSiftOctave(const DetectorConfigDevice *cfg, SiftData &siftData,
 #endif
   float baseBlur = pow(2.0f, -1.0f / NUM_SCALES);
   float diffScale = pow(2.0f, 1.0f / NUM_SCALES);
-  LaplaceMulti(cfg, texObj, img, diffImg, octave);
-  FindPointsMulti(cfg, diffImg, siftData, thresh, 10.0f, 1.0f / NUM_SCALES,
+  LaplaceMulti(texObj, img, diffImg, octave);
+  FindPointsMulti(diffImg, siftData, 10.0f, 1.0f / NUM_SCALES,
                   lowestScale / subsampling, subsampling, octave);
 #ifdef VERBOSE
   double gpuTimeDoG = timer1.read();
   TimerGPU timer4;
 #endif
-  ComputeOrientations(cfg, texObj, img, siftData, octave);
-  ExtractSiftDescriptors(cfg, texObj, siftData, normalizer_d, subsampling,
-                         octave);
+  ComputeOrientations(texObj, img, siftData, octave);
+  ExtractSiftDescriptors(texObj, siftData, subsampling, octave);
 
   safeCall(cudaDestroyTextureObject(texObj));
 #ifdef VERBOSE
@@ -348,13 +353,13 @@ void PrintSiftData(SiftData &data) {
 // Host side master functions
 ///////////////////////////////////////////////////////////////////////////////
 
-double ScaleDown(DetectorConfigHost *cfg, CudaImage &res, CudaImage &src,
-                 float variance) {
+double SiftDetectorImpl::ScaleDown(CudaImage &res, CudaImage &src,
+                                   float variance) {
   if (res.d_data == NULL || src.d_data == NULL) {
     printf("ScaleDown: missing data\n");
     return 0.0;
   }
-  if (cfg->oldVarianceScaleDown != variance) {
+  if (configHost.oldVarianceScaleDown != variance) {
     float h_Kernel[5];
     float kernelSum = 0.0f;
     for (int j = 0; j < 5; j++) {
@@ -363,77 +368,78 @@ double ScaleDown(DetectorConfigHost *cfg, CudaImage &res, CudaImage &src,
     }
     for (int j = 0; j < 5; j++)
       h_Kernel[j] /= kernelSum;
-    cfg->oldVarianceScaleDown = variance;
-    safeCall(cudaMemcpy(cfg->scaleDownKernel, h_Kernel, 5 * sizeof(float),
+    configHost.oldVarianceScaleDown = variance;
+    safeCall(cudaMemcpy(configHost.scaleDownKernel, h_Kernel, 5 * sizeof(float),
                         cudaMemcpyHostToDevice));
   }
   dim3 blocks(iDivUp(src.width, SCALEDOWN_W), iDivUp(src.height, SCALEDOWN_H));
   dim3 threads(SCALEDOWN_W + 4);
-  ScaleDown<<<blocks, threads>>>(cfg->dev, res.d_data, src.d_data, src.width,
-                                 src.pitch, src.height, res.pitch);
+  cudasift::ScaleDown<<<blocks, threads>>>(configHost.dev, res.d_data,
+                                           src.d_data, src.width, src.pitch,
+                                           src.height, res.pitch);
 
   checkMsg("ScaleDown() execution failed\n");
   return 0.0;
 }
 
-double ScaleUp(CudaImage &res, CudaImage &src) {
+double SiftDetectorImpl::ScaleUp(CudaImage &res, CudaImage &src) {
   if (res.d_data == NULL || src.d_data == NULL) {
     printf("ScaleUp: missing data\n");
     return 0.0;
   }
   dim3 blocks(iDivUp(res.width, SCALEUP_W), iDivUp(res.height, SCALEUP_H));
   dim3 threads(SCALEUP_W / 2, SCALEUP_H / 2);
-  ScaleUp<<<blocks, threads>>>(res.d_data, src.d_data, src.width, src.pitch,
-                               src.height, res.pitch);
+  cudasift::ScaleUp<<<blocks, threads>>>(res.d_data, src.d_data, src.width,
+                                         src.pitch, src.height, res.pitch);
   checkMsg("ScaleUp() execution failed\n");
   return 0.0;
 }
 
-double ComputeOrientations(const DetectorConfigDevice *cfg,
-                           cudaTextureObject_t texObj, CudaImage &src,
-                           SiftData &siftData, int octave) {
+double SiftDetectorImpl::ComputeOrientations(cudaTextureObject_t texObj,
+                                             CudaImage &src, SiftData &siftData,
+                                             int octave) {
   dim3 blocks(512);
 #ifdef MANAGEDMEM
-  ComputeOrientationsCONST<<<blocks, threads>>>(cfg, texObj, siftData.m_data,
-                                                octave);
+  ComputeOrientationsCONST<<<blocks, threads>>>(configHost.dev, texObj,
+                                                siftData.m_data, octave);
 #else
   dim3 threads(11 * 11);
-  ComputeOrientationsCONST<<<blocks, threads>>>(cfg, texObj, siftData.d_data,
-                                                octave);
+  ComputeOrientationsCONST<<<blocks, threads>>>(configHost.dev, texObj,
+                                                siftData.d_data, octave);
 #endif
   checkMsg("ComputeOrientations() execution failed\n");
   return 0.0;
 }
 
-double ExtractSiftDescriptors(const DetectorConfigDevice *cfg,
-                              cudaTextureObject_t texObj, SiftData &siftData,
-                              const DescriptorNormalizerData *normalizer_d,
-                              float subsampling, int octave) {
+double SiftDetectorImpl::ExtractSiftDescriptors(cudaTextureObject_t texObj,
+                                                SiftData &siftData,
+                                                float subsampling, int octave) {
   dim3 blocks(512);
   dim3 threads(16, 8);
 #ifdef MANAGEDMEM
   ExtractSiftDescriptorsCONST<<<blocks, threads>>>(
-      cfg, texObj, siftData.m_data, normalizer_d, subsampling, octave);
+      configHost.dev, texObj, siftData.m_data, p_normalizer_d, subsampling,
+      octave);
 #else
   ExtractSiftDescriptorsCONSTNew<<<blocks, threads>>>(
-      cfg, texObj, siftData.d_data, normalizer_d, subsampling, octave);
+      configHost.dev, texObj, siftData.d_data, p_normalizer_d, subsampling,
+      octave);
 #endif
   checkMsg("ExtractSiftDescriptors() execution failed\n");
   return 0.0;
 }
 
-double RescalePositions(SiftData &siftData, float scale) {
+double SiftDetectorImpl::RescalePositions(SiftData &siftData, float scale) {
   dim3 blocks(iDivUp(siftData.numPts, 64));
   dim3 threads(64);
-  RescalePositions<<<blocks, threads>>>(siftData.d_data, siftData.numPts,
-                                        scale);
+  cudasift::RescalePositions<<<blocks, threads>>>(siftData.d_data,
+                                                  siftData.numPts, scale);
   checkMsg("RescapePositions() execution failed\n");
   return 0.0;
 }
 
-double LowPass(DetectorConfigHost *cfg, CudaImage &res, CudaImage &src,
-               float scale) {
-  if (scale != cfg->oldScaleLowPass) {
+double SiftDetectorImpl::LowPass(CudaImage &res, CudaImage &src, float scale) {
+  if (scale != configHost.oldScaleLowPass) {
     float kernel[2 * LOWPASS_R + 1];
     float kernelSum = 0.0f;
     float ivar2 = 1.0f / (2.0f * scale * scale);
@@ -443,10 +449,10 @@ double LowPass(DetectorConfigHost *cfg, CudaImage &res, CudaImage &src,
     }
     for (int j = -LOWPASS_R; j <= LOWPASS_R; j++)
       kernel[j + LOWPASS_R] /= kernelSum;
-    safeCall(cudaMemcpy(cfg->lowPassKernel, kernel,
+    safeCall(cudaMemcpy(configHost.lowPassKernel, kernel,
                         (2 * LOWPASS_R + 1) * sizeof(float),
                         cudaMemcpyHostToDevice));
-    cfg->oldScaleLowPass = scale;
+    configHost.oldScaleLowPass = scale;
   }
   int width = res.width;
   int pitch = res.pitch;
@@ -454,15 +460,16 @@ double LowPass(DetectorConfigHost *cfg, CudaImage &res, CudaImage &src,
   dim3 blocks(iDivUp(width, LOWPASS_W), iDivUp(height, LOWPASS_H));
 
   dim3 threads(LOWPASS_W + 2 * LOWPASS_R, 4);
-  LowPassBlock<<<blocks, threads>>>(cfg->dev, src.d_data, res.d_data, width,
-                                    pitch, height);
+  LowPassBlock<<<blocks, threads>>>(configHost.dev, src.d_data, res.d_data,
+                                    width, pitch, height);
   checkMsg("LowPass() execution failed\n");
   return 0.0;
 }
 
 //==================== Multi-scale functions ===================//
 
-void PrepareLaplaceKernels(int numOctaves, float initBlur, float *kernel) {
+void SiftDetectorImpl::PrepareLaplaceKernels(int numOctaves, float initBlur,
+                                             float *kernel) {
   if (numOctaves > 1) {
     float totInitBlur = (float)sqrt(initBlur * initBlur + 0.5f * 0.5f) / 2.0f;
     PrepareLaplaceKernels(numOctaves - 1, totInitBlur, kernel);
@@ -483,24 +490,26 @@ void PrepareLaplaceKernels(int numOctaves, float initBlur, float *kernel) {
   }
 }
 
-double LaplaceMulti(const DetectorConfigDevice *cfg, cudaTextureObject_t texObj,
-                    CudaImage &baseImage, CudaImage *results, int octave) {
+double SiftDetectorImpl::LaplaceMulti(cudaTextureObject_t texObj,
+                                      CudaImage &baseImage, CudaImage *results,
+                                      int octave) {
   int width = results[0].width;
   int pitch = results[0].pitch;
   int height = results[0].height;
 
   dim3 threads(LAPLACE_W + 2 * LAPLACE_R);
   dim3 blocks(iDivUp(width, LAPLACE_W), height);
-  LaplaceMultiMem<<<blocks, threads>>>(cfg, baseImage.d_data, results[0].d_data,
-                                       width, pitch, height, octave);
+  LaplaceMultiMem<<<blocks, threads>>>(configHost.dev, baseImage.d_data,
+                                       results[0].d_data, width, pitch, height,
+                                       octave);
   checkMsg("LaplaceMulti() execution failed\n");
   return 0.0;
 }
 
-double FindPointsMulti(const DetectorConfigDevice *cfg, CudaImage *sources,
-                       SiftData &siftData, float thresh, float edgeLimit,
-                       float factor, float lowestScale, float subsampling,
-                       int octave) {
+double SiftDetectorImpl::FindPointsMulti(CudaImage *sources, SiftData &siftData,
+                                         float edgeLimit, float factor,
+                                         float lowestScale, float subsampling,
+                                         int octave) {
   if (sources->d_data == NULL) {
     printf("FindPointsMulti: missing data\n");
     return 0.0;
@@ -512,13 +521,13 @@ double FindPointsMulti(const DetectorConfigDevice *cfg, CudaImage *sources,
   dim3 blocks(iDivUp(w, MINMAX_W) * NUM_SCALES, iDivUp(h, MINMAX_H));
   dim3 threads(MINMAX_W + 2);
 #ifdef MANAGEDMEM
-  FindPointsMulti<<<blocks, threads>>>(cfg, sources->d_data, siftData.m_data, w,
-                                       p, h, subsampling, lowestScale, thresh,
-                                       factor, edgeLimit, octave);
+  FindPointsMulti<<<blocks, threads>>>(
+      configHost.dev, sources->d_data, siftData.m_data, w, p, h, subsampling,
+      lowestScale, params.threshold, factor, edgeLimit, octave);
 #else
-  FindPointsMultiNew<<<blocks, threads>>>(cfg, sources->d_data, siftData.d_data,
-                                          w, p, h, subsampling, lowestScale,
-                                          thresh, factor, edgeLimit, octave);
+  FindPointsMultiNew<<<blocks, threads>>>(
+      configHost.dev, sources->d_data, siftData.d_data, w, p, h, subsampling,
+      lowestScale, params.threshold, factor, edgeLimit, octave);
 #endif
   checkMsg("FindPointsMulti() execution failed\n");
   return 0.0;
