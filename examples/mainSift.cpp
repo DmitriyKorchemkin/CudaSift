@@ -63,28 +63,54 @@ int main(int argc, char **argv) {
   data.normalizer_steps = steps;
   data.data = dataf;
 
+  const int N = 10000;
+  std::vector<double> detect, match;
+
   // A bit of benchmarking
   // for (int thresh1=1.00f;thresh1<=4.01f;thresh1+=0.50f) {
   float *memoryTmp = AllocSiftTempMemory(w, h, 5, false);
-  for (int i = 0; i < 1000; i++) {
+  for (int i = 0; i < N; i++) {
+    auto start = std::chrono::high_resolution_clock::now();
     ExtractSift(siftData1, img1, 5, initBlur, thresh, data, 0.0f, false,
                 memoryTmp);
+    auto stop1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff1 = stop1 - start;
+    double delta;
+    delta = diff1.count();
+    detect.push_back(delta);
     ExtractSift(siftData2, img2, 5, initBlur, thresh, data, 0.0f, false,
                 memoryTmp);
+    auto stop2 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff2 = stop2 - stop1;
+    delta = diff2.count();
+    detect.push_back(delta);
   }
   FreeSiftTempMemory(memoryTmp);
 
   // Match Sift features and find a homography
-  for (int i = 0; i < 1; i++)
+  for (int i = 0; i < N; i++) {
+    auto start = std::chrono::high_resolution_clock::now();
     MatchSiftData(siftData1, siftData2);
+    auto stop = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = stop - start;
+    double delta = diff.count();
+    match.push_back(delta);
+  }
   float homography[9];
   int numMatches;
   std::cout << "Number of original features: " << siftData1.numPts << " "
             << siftData2.numPts << std::endl;
 
-  cv::imwrite("data/limg_pts.pgm", limg);
+  std::sort(detect.begin(), detect.end());
+  std::sort(match.begin(), match.end());
+  double med;
+  med = detect[0.5 * N];
+  std::cout << "Detect: [" << med << " -" << (med - detect[0.0005 * N]) << " +"
+            << (detect[0.9995 * N] - med) << "]" << std::endl;
+  med = match[0.5 * N];
+  std::cout << "Match: [" << med << " -" << (med - match[0.0005 * N]) << " +"
+            << (match[0.9995 * N] - med) << "]" << std::endl;
 
-  // Free Sift data from device
   FreeSiftData(siftData1);
   FreeSiftData(siftData2);
 }

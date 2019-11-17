@@ -3,7 +3,6 @@ set(LIBRARY_NAME "cudasift")
 
 set(SOURCE_FILES
     src/cudaImage.cu
-    src/cudaSiftD.cu
     src/cudaSiftH.cu
     src/matching.cu
 	)

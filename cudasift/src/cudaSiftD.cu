@@ -7,22 +7,12 @@
 #include "cudasift/cudautils.h"
 
 namespace cudasift {
-
-///////////////////////////////////////////////////////////////////////////////
-// Kernel configuration
-///////////////////////////////////////////////////////////////////////////////
-
-__constant__ int d_MaxNumPoints;
-__device__ unsigned int d_PointCounter[8 * 2 + 1];
-__constant__ float d_ScaleDownKernel[5];
-__constant__ float d_LowPassKernel[2 * LOWPASS_R + 1];
-__constant__ float d_LaplaceKernel[8 * 12 * 16];
-
 ///////////////////////////////////////////////////////////////////////////////
 // Lowpass filter and subsample image
 ///////////////////////////////////////////////////////////////////////////////
-__global__ void ScaleDown(float *d_Result, float *d_Data, int width, int pitch,
-                          int height, int newpitch) {
+__global__ void ScaleDown(const DetectorConfigDevice *cfg, float *d_Result,
+                          float *d_Data, int width, int pitch, int height,
+                          int newpitch) {
   __shared__ float inrow[SCALEDOWN_W + 4];
   __shared__ float brow[5 * (SCALEDOWN_W / 2)];
   __shared__ int yRead[SCALEDOWN_H + 4];
@@ -37,9 +27,9 @@ __global__ void ScaleDown(float *d_Result, float *d_Data, int width, int pitch,
   const int xStart = blockIdx.x * SCALEDOWN_W;
   const int yStart = blockIdx.y * SCALEDOWN_H;
   const int xWrite = xStart / 2 + tx;
-  float k0 = d_ScaleDownKernel[0];
-  float k1 = d_ScaleDownKernel[1];
-  float k2 = d_ScaleDownKernel[2];
+  float k0 = cfg->scaleDownKernel[0];
+  float k1 = cfg->scaleDownKernel[1];
+  float k2 = cfg->scaleDownKernel[2];
   if (tx < SCALEDOWN_H + 4) {
     int y = yStart + tx - 2;
     y = (y < 0 ? 0 : y);
@@ -221,7 +211,8 @@ __device__ void normalize(float *buffer, float *desc, int idx,
 }
 
 __global__ void
-ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftPoint *d_sift,
+ExtractSiftDescriptorsCONSTNew(const DetectorConfigDevice *cfg,
+                               cudaTextureObject_t texObj, SiftPoint *d_sift,
                                const DescriptorNormalizerData *normalizer_d,
                                float subsampling, int octave) {
   __shared__ float gauss[16];
@@ -233,11 +224,11 @@ ExtractSiftDescriptorsCONSTNew(cudaTextureObject_t texObj, SiftPoint *d_sift,
   if (ty == 0)
     gauss[tx] = __expf(-(tx - 7.5f) * (tx - 7.5f) / 128.0f);
 
-  int fstPts = min(d_PointCounter[2 * octave - 1], d_MaxNumPoints);
-  int totPts = min(d_PointCounter[2 * octave + 1], d_MaxNumPoints);
+  int fstPts = min(cfg->pointCounter[2 * octave - 1], cfg->maxNumPoints);
+  int totPts = min(cfg->pointCounter[2 * octave + 1], cfg->maxNumPoints);
   // if (tx==0 && ty==0)
-  //  printf("%d %d %d %d\n", octave, fstPts, min(d_PointCounter[2*octave],
-  //  d_MaxNumPoints), totPts);
+  //  printf("%d %d %d %d\n", octave, fstPts, min(cfg->pointCounter[2*octave],
+  //  cfg->maxNumPoints), totPts);
   for (int bx = blockIdx.x + fstPts; bx < totPts; bx += gridDim.x) {
 
     buffer[idx] = 0.0f;
@@ -430,7 +421,8 @@ __global__ void RescalePositions(SiftPoint *d_sift, int numPts, float scale) {
   }
 }
 
-__global__ void ComputeOrientations(cudaTextureObject_t texObj,
+__global__ void ComputeOrientations(const DetectorConfigDevice *cfg,
+                                    cudaTextureObject_t texObj,
                                     SiftPoint *d_Sift, int fstPts) {
   __shared__ float hist[64];
   __shared__ float gauss[11];
@@ -499,8 +491,8 @@ __global__ void ComputeOrientations(cudaTextureObject_t texObj,
       float val1 = hist[32 + ((i2 + 1) & 31)];
       float val2 = hist[32 + ((i2 + 31) & 31)];
       float peak = i2 + 0.5f * (val1 - val2) / (2.0f * maxval2 - val1 - val2);
-      unsigned int idx = atomicInc(d_PointCounter, 0x7fffffff);
-      if (idx < d_MaxNumPoints) {
+      unsigned int idx = atomicInc(cfg->pointCounter, 0x7fffffff);
+      if (idx < cfg->maxNumPoints) {
         d_Sift[idx].xpos = d_Sift[bx].xpos;
         d_Sift[idx].ypos = d_Sift[bx].ypos;
         d_Sift[idx].scale = d_Sift[bx].scale;
@@ -515,14 +507,15 @@ __global__ void ComputeOrientations(cudaTextureObject_t texObj,
 }
 
 // With constant number of blocks
-__global__ void ComputeOrientationsCONST(cudaTextureObject_t texObj,
+__global__ void ComputeOrientationsCONST(const DetectorConfigDevice *cfg,
+                                         cudaTextureObject_t texObj,
                                          SiftPoint *d_Sift, int octave) {
   __shared__ float hist[64];
   __shared__ float gauss[11];
   const int tx = threadIdx.x;
 
-  int fstPts = min(d_PointCounter[2 * octave - 1], d_MaxNumPoints);
-  int totPts = min(d_PointCounter[2 * octave + 0], d_MaxNumPoints);
+  int fstPts = min(cfg->pointCounter[2 * octave - 1], cfg->maxNumPoints);
+  int totPts = min(cfg->pointCounter[2 * octave + 0], cfg->maxNumPoints);
   for (int bx = blockIdx.x + fstPts; bx < totPts; bx += gridDim.x) {
 
     float i2sigma2 =
@@ -585,15 +578,15 @@ __global__ void ComputeOrientationsCONST(cudaTextureObject_t texObj,
       float val2 = hist[32 + ((i1 + 31) & 31)];
       float peak = i1 + 0.5f * (val1 - val2) / (2.0f * maxval1 - val1 - val2);
       d_Sift[bx].orientation = 11.25f * (peak < 0.0f ? peak + 32.0f : peak);
-      atomicMax(&d_PointCounter[2 * octave + 1],
-                d_PointCounter[2 * octave + 0]);
+      atomicMax(&cfg->pointCounter[2 * octave + 1],
+                cfg->pointCounter[2 * octave + 0]);
       if (maxval2 > 0.8f * maxval1 && true) {
         float val1 = hist[32 + ((i2 + 1) & 31)];
         float val2 = hist[32 + ((i2 + 31) & 31)];
         float peak = i2 + 0.5f * (val1 - val2) / (2.0f * maxval2 - val1 - val2);
         unsigned int idx =
-            atomicInc(&d_PointCounter[2 * octave + 1], 0x7fffffff);
-        if (idx < d_MaxNumPoints) {
+            atomicInc(&cfg->pointCounter[2 * octave + 1], 0x7fffffff);
+        if (idx < cfg->maxNumPoints) {
           d_Sift[idx].xpos = d_Sift[bx].xpos;
           d_Sift[idx].ypos = d_Sift[bx].ypos;
           d_Sift[idx].scale = d_Sift[bx].scale;
@@ -614,7 +607,8 @@ __global__ void ComputeOrientationsCONST(cudaTextureObject_t texObj,
 // Subtract two images (multi-scale version)
 ///////////////////////////////////////////////////////////////////////////////
 
-__global__ void FindPointsMultiNew(float *d_Data0, SiftPoint *d_Sift, int width,
+__global__ void FindPointsMultiNew(const DetectorConfigDevice *cfg,
+                                   float *d_Data0, SiftPoint *d_Sift, int width,
                                    int pitch, int height, float subsampling,
                                    float lowestScale, float thresh,
                                    float factor, float edgeLimit, int octave) {
@@ -622,8 +616,10 @@ __global__ void FindPointsMultiNew(float *d_Data0, SiftPoint *d_Sift, int width,
   __shared__ unsigned short points[2 * MEMWID];
 
   if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-    atomicMax(&d_PointCounter[2 * octave + 0], d_PointCounter[2 * octave - 1]);
-    atomicMax(&d_PointCounter[2 * octave + 1], d_PointCounter[2 * octave - 1]);
+    atomicMax(&cfg->pointCounter[2 * octave + 0],
+              cfg->pointCounter[2 * octave - 1]);
+    atomicMax(&cfg->pointCounter[2 * octave + 1],
+              cfg->pointCounter[2 * octave - 1]);
   }
   int tx = threadIdx.x;
   int block = blockIdx.x / NUM_SCALES;
@@ -744,13 +740,13 @@ __global__ void FindPointsMultiNew(float *d_Data0, SiftPoint *d_Sift, int width,
         pds = __fdividef(ds, dss);
       }
       float dval = 0.5f * (dx * pdx + dy * pdy + ds * pds);
-      int maxPts = d_MaxNumPoints;
+      int maxPts = cfg->maxNumPoints;
       float sc = powf(2.0f, (float)scale / NUM_SCALES) * exp2f(pds * factor);
       if (sc >= lowestScale) {
-        atomicMax(&d_PointCounter[2 * octave + 0],
-                  d_PointCounter[2 * octave - 1]);
+        atomicMax(&cfg->pointCounter[2 * octave + 0],
+                  cfg->pointCounter[2 * octave - 1]);
         unsigned int idx =
-            atomicInc(&d_PointCounter[2 * octave + 0], 0x7fffffff);
+            atomicInc(&cfg->pointCounter[2 * octave + 0], 0x7fffffff);
         idx = (idx >= maxPts ? maxPts - 1 : idx);
         d_Sift[idx].xpos = xpos + pdx;
         d_Sift[idx].ypos = ypos + pdy;
@@ -763,8 +759,9 @@ __global__ void FindPointsMultiNew(float *d_Data0, SiftPoint *d_Sift, int width,
   }
 }
 
-__global__ void FindPointsMulti(float *d_Data0, SiftPoint *d_Sift, int width,
-                                int pitch, int height, float subsampling,
+__global__ void FindPointsMulti(const DetectorConfigDevice *cfg, float *d_Data0,
+                                SiftPoint *d_Sift, int width, int pitch,
+                                int height, float subsampling,
                                 float lowestScale, float thresh, float factor,
                                 float edgeLimit, int octave) {
 #define MEMWID (MINMAX_W + 2)
@@ -772,8 +769,10 @@ __global__ void FindPointsMulti(float *d_Data0, SiftPoint *d_Sift, int width,
   __shared__ unsigned short points[3 * MEMWID];
 
   if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-    atomicMax(&d_PointCounter[2 * octave + 0], d_PointCounter[2 * octave - 1]);
-    atomicMax(&d_PointCounter[2 * octave + 1], d_PointCounter[2 * octave - 1]);
+    atomicMax(&cfg->pointCounter[2 * octave + 0],
+              cfg->pointCounter[2 * octave - 1]);
+    atomicMax(&cfg->pointCounter[2 * octave + 1],
+              cfg->pointCounter[2 * octave - 1]);
   }
   int tx = threadIdx.x;
   int block = blockIdx.x / NUM_SCALES;
@@ -893,13 +892,13 @@ __global__ void FindPointsMulti(float *d_Data0, SiftPoint *d_Sift, int width,
         pds = __fdividef(ds, dss);
       }
       float dval = 0.5f * (dx * pdx + dy * pdy + ds * pds);
-      int maxPts = d_MaxNumPoints;
+      int maxPts = cfg->maxNumPoints;
       float sc = powf(2.0f, (float)scale / NUM_SCALES) * exp2f(pds * factor);
       if (sc >= lowestScale) {
-        atomicMax(&d_PointCounter[2 * octave + 0],
-                  d_PointCounter[2 * octave - 1]);
+        atomicMax(&cfg->pointCounter[2 * octave + 0],
+                  cfg->pointCounter[2 * octave - 1]);
         unsigned int idx =
-            atomicInc(&d_PointCounter[2 * octave + 0], 0x7fffffff);
+            atomicInc(&cfg->pointCounter[2 * octave + 0], 0x7fffffff);
         idx = (idx >= maxPts ? maxPts - 1 : idx);
         d_Sift[idx].xpos = xpos + pdx;
         d_Sift[idx].ypos = ypos + pdy;
@@ -912,8 +911,9 @@ __global__ void FindPointsMulti(float *d_Data0, SiftPoint *d_Sift, int width,
   }
 }
 
-__global__ void LaplaceMultiMem(float *d_Image, float *d_Result, int width,
-                                int pitch, int height, int octave) {
+__global__ void LaplaceMultiMem(const DetectorConfigDevice *cfg, float *d_Image,
+                                float *d_Result, int width, int pitch,
+                                int height, int octave) {
   __shared__ float buff[(LAPLACE_W + 2 * LAPLACE_R) * LAPLACE_S];
   const int tx = threadIdx.x;
   const int xp = blockIdx.x * LAPLACE_W + tx;
@@ -925,7 +925,7 @@ __global__ void LaplaceMultiMem(float *d_Image, float *d_Result, int width,
       temp[i] = data[max(0, min(yp + i - LAPLACE_R, height - 1)) * pitch];
     for (int scale = 0; scale < LAPLACE_S; scale++) {
       float *buf = buff + (LAPLACE_W + 2 * LAPLACE_R) * scale;
-      float *kernel = d_LaplaceKernel + octave * 12 * 16 + scale * 16;
+      const float *kernel = cfg->laplaceKernel + octave * 12 * 16 + scale * 16;
       for (int i = 0; i <= LAPLACE_R; i++)
         kern[scale][i] = kernel[i];
       float sum = kern[scale][0] * temp[LAPLACE_R];
@@ -956,15 +956,16 @@ __global__ void LaplaceMultiMem(float *d_Image, float *d_Result, int width,
   }
 }
 
-__global__ void LowPassBlock(float *d_Image, float *d_Result, int width,
-                             int pitch, int height) {
+__global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
+                             float *d_Result, int width, int pitch,
+                             int height) {
   __shared__ float xrows[16][32];
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
   const int xp = blockIdx.x * LOWPASS_W + tx;
   const int yp = blockIdx.y * LOWPASS_H + ty;
   const int N = 16;
-  float *k = d_LowPassKernel;
+  const float *k = cfg->lowPassKernel;
   int xl = max(min(xp - 4, width - 1), 0);
 #pragma unroll
   for (int l = -8; l < 4; l += 4) {
