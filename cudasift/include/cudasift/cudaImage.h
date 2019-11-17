@@ -1,9 +1,11 @@
 //********************************************************//
 // CUDA SIFT extractor by Marten Bjorkman aka Celebrandil //
-//********************************************************//  
+//********************************************************//
 
 #ifndef CUDAIMAGE_H
 #define CUDAIMAGE_H
+
+namespace cudasift {
 
 class CudaImage {
 public:
@@ -14,10 +16,12 @@ public:
   float *t_data;
   bool d_internalAlloc;
   bool h_internalAlloc;
+
 public:
   CudaImage();
   ~CudaImage();
-  void Allocate(int width, int height, int pitch, bool withHost, float *devMem = NULL, float *hostMem = NULL);
+  void Allocate(int width, int height, int pitch, bool withHost,
+                float *devMem = nullptr, float *hostMem = nullptr);
   double Download();
   double Readback();
   double InitTexture();
@@ -30,5 +34,7 @@ int iAlignUp(int a, int b);
 int iAlignDown(int a, int b);
 void StartTimer(unsigned int *hTimer);
 double StopTimer(unsigned int hTimer);
+
+} // namespace cudasift
 
 #endif // CUDAIMAGE_H

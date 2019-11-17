@@ -3,9 +3,11 @@
 
 #include "cudasift/cudaImage.h"
 
+namespace cudasift {
+
 typedef struct {
   float xpos;
-  float ypos;   
+  float ypos;
   float scale;
   float sharpness;
   float edgeness;
@@ -22,16 +24,44 @@ typedef struct {
 } SiftPoint;
 
 typedef struct {
-  int numPts;         // Number of available Sift points
-  int maxPts;         // Number of allocated Sift points
+  int numPts; // Number of available Sift points
+  int maxPts; // Number of allocated Sift points
 #ifdef MANAGEDMEM
-  SiftPoint *m_data;  // Managed data
+  SiftPoint *m_data; // Managed data
 #else
-  SiftPoint *h_data;  // Host (CPU) data
-  SiftPoint *d_data;  // Device (GPU) data
+  SiftPoint *h_data; // Host (CPU) data
+  SiftPoint *d_data; // Device (GPU) data
 #endif
 
 } SiftData;
+
+enum NormalizerOp {
+  CopyToOutput,
+  ComputeL2,
+  CopmuteL1,
+  DivideByNorm,
+  Clamp,
+  Add,
+  Mul,
+  Sqrt,
+  OP_LAST
+};
+
+constexpr size_t OpDataSize(const NormalizerOp &op) {
+  if (op >= OP_LAST)
+    return ~(size_t)0;
+
+  switch (op) {
+  case Clamp:
+    return 1;
+  case Add:
+    return 128;
+  case Mul:
+    return 128 * 128;
+  default:
+    return 0;
+  }
+}
 
 typedef struct {
   /*
@@ -61,17 +91,20 @@ typedef struct {
 } DescriptorNormalizerData;
 
 void InitCuda(int devNum = 0);
-float *AllocSiftTempMemory(int width, int height, int numOctaves, bool scaleUp = false);
+float *AllocSiftTempMemory(int width, int height, int numOctaves,
+                           bool scaleUp = false);
 void FreeSiftTempMemory(float *memoryTmp);
 void ExtractSift(SiftData &siftData, CudaImage &img, int numOctaves,
                  double initBlur, float thresh,
                  const DescriptorNormalizerData &normalizer,
                  float lowestScale = 0.0f, bool scaleUp = false,
                  float *tempMemory = 0);
-void InitSiftData(SiftData &data, int num = 1024, bool host = false, bool dev = true);
+void InitSiftData(SiftData &data, int num = 1024, bool host = false,
+                  bool dev = true);
 void FreeSiftData(SiftData &data);
 void PrintSiftData(SiftData &data);
 double MatchSiftData(SiftData &data1, SiftData &data2);
-double FindHomography(SiftData &data,  float *homography, int *numMatches, int numLoops = 1000, float minScore = 0.85f, float maxAmbiguity = 0.95f, float thresh = 5.0f);
+
+} // namespace cudasift
 
 #endif
