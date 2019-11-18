@@ -31,7 +31,8 @@ void CudaImage::Allocate(int w, int h, int p, bool host, float *devmem,
     d_internalAlloc = true;
   }
   if (host && hostmem == NULL) {
-    h_data = (float *)malloc(sizeof(float) * pitch * height);
+    safeCall(cudaHostAlloc((void **)&h_data, sizeof(float) * pitch * height,
+                           cudaHostAllocPortable));
     h_internalAlloc = true;
   }
 }
@@ -45,7 +46,7 @@ CudaImage::~CudaImage() {
     safeCall(cudaFree(d_data));
   d_data = NULL;
   if (h_internalAlloc && h_data != NULL)
-    free(h_data);
+    safeCall(cudaFreeHost(h_data));
   h_data = NULL;
   if (t_data != NULL)
     safeCall(cudaFreeArray((cudaArray *)t_data));
