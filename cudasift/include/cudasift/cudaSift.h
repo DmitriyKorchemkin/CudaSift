@@ -49,7 +49,7 @@ void PrintSiftData(SiftData &data);
 double MatchSiftData(SiftData &data1, SiftData &data2);
 
 struct DetectorConfigDevice {
-  DetectorConfigDevice(int, void **);
+  DetectorConfigDevice(int, void **, cudaStream_t);
   ~DetectorConfigDevice();
 
   mutable uint32_t pointCounter[8 * 2 + 1];
@@ -64,7 +64,7 @@ private:
 };
 
 struct DetectorConfigHost {
-  DetectorConfigHost(int);
+  DetectorConfigHost(int, cudaStream_t);
   ~DetectorConfigHost();
 
   DetectorConfigDevice *dev;
@@ -82,7 +82,7 @@ private:
 
 struct SiftDetectorImpl {
   SiftDetectorImpl(const SiftParams &params = SiftParams(), int device = 0,
-                   void *stream = nullptr);
+                   cudaStream_t stream = nullptr);
 
   ~SiftDetectorImpl();
   void ExtractSift(SiftData &siftData, CudaImage &img);
@@ -117,7 +117,7 @@ private:
   CudaImage scaledUp, lowImg;
 
   SiftParams params;
-  void *stream;
+  cudaStream_t stream;
   int device;
   DescriptorNormalizerData *p_normalizer_d;
 };
