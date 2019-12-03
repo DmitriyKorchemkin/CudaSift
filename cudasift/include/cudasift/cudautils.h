@@ -2,6 +2,7 @@
 #define CUDAUTILS_H
 
 #include <cstdio>
+#include <cuda_runtime.h>
 #include <iostream>
 
 #ifdef WIN32
@@ -9,7 +10,6 @@
 #endif
 
 #define safeCall(err) __safeCall(err, __FILE__, __LINE__)
-#define safeThreadSync() __safeThreadSync(__FILE__, __LINE__)
 #define checkMsg(msg) __checkMsg(msg, __FILE__, __LINE__)
 
 namespace cudasift {
@@ -19,17 +19,6 @@ inline void __safeCall(cudaError err, const char *file, const int line) {
     fprintf(stderr,
             "safeCall() Runtime API error in file <%s>, line %i : %s.\n", file,
             line, cudaGetErrorString(err));
-    exit(-1);
-  }
-}
-
-inline void __safeThreadSync(const char *file, const int line) {
-  cudaError err = cudaDeviceSynchronize();
-  if (cudaSuccess != err) {
-    fprintf(
-        stderr,
-        "threadSynchronize() Driver API error in file '%s' in line %i : %s.\n",
-        file, line, cudaGetErrorString(err));
     exit(-1);
   }
 }
@@ -69,7 +58,7 @@ class TimerGPU {
 public:
   cudaEvent_t start, stop;
   cudaStream_t stream;
-  TimerGPU(cudaStream_t stream_ = 0) : stream(stream_) {
+  TimerGPU(cudaStream_t stream_) : stream(stream_) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, stream);

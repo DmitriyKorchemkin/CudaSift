@@ -158,10 +158,10 @@ __device__ void normalize(float *buffer, float *desc, int idx,
   int offset = 0;
   for (int i = 0; i < data->n_steps; ++i) {
     switch (data->normalizer_steps[i]) {
-    case 0: {
+    case CopyToOutput: {
       desc[idx] = buffer[idx];
     }
-    case 1: {
+    case ComputeL2: {
       float sum = buffer[idx] * buffer[idx];
       for (int i = 16; i > 0; i /= 2)
         sum += ShiftDown(sum, i);
@@ -170,7 +170,7 @@ __device__ void normalize(float *buffer, float *desc, int idx,
       __syncthreads();
       accumulator = sqrtf(sums[0] + sums[1] + sums[2] + sums[3]);
     } break;
-    case 2: {
+    case ComputeL1: {
       float sum = abs(buffer[idx]);
       for (int i = 16; i > 0; i /= 2)
         sum += ShiftDown(sum, i);
@@ -179,29 +179,30 @@ __device__ void normalize(float *buffer, float *desc, int idx,
       __syncthreads();
       accumulator = sums[0] + sums[1] + sums[2] + sums[3];
     } break;
-    case 3: {
+    case DivideByNorm: {
       buffer[idx] = buffer[idx] / accumulator;
       __syncthreads();
     } break;
-    case 4: {
+    case Clamp: {
       const float alpha = data->data[offset++];
       const float threshold = alpha * accumulator;
       const float v = buffer[idx];
       buffer[idx] = v >= 0.f ? (v > threshold ? threshold : v)
                              : (v < -threshold ? -threshold : v);
     } break;
-    case 5: {
+    case Add: {
       buffer[idx] = buffer[idx] + data->data[offset + idx];
       offset += 128;
     } break;
-    case 6: {
+    case Mul: {
       float acc = 0.f;
       for (int i = 0; i < 128; ++i)
         acc += data->data[offset + idx * 128 + i] * buffer[i];
       __syncthreads();
       buffer[idx] = acc;
+      offset += 128 * 128;
     } break;
-    case 7: {
+    case Sqrt: {
       const float v = buffer[idx];
       buffer[idx] = v < 0.f ? -sqrtf(-v) : sqrtf(v);
     } break;
@@ -252,7 +253,8 @@ ExtractSiftDescriptorsCONSTNew(const DetectorConfigDevice *cfg,
       float dy = tex2D<float>(texObj, xpos - sina, ypos + cosa) -
                  tex2D<float>(texObj, xpos + sina, ypos - cosa);
       float grad = gauss[y] * gauss[tx] * __fsqrt_rn(dx * dx + dy * dy);
-      float angf = 4.0f / 3.1415f * FastAtan2(dy, dx) + 4.0f;
+      float angf =
+          min(max(0.f, 4.0f / 3.1415f * FastAtan2(dy, dx) + 4.0f), 8.f - 1e-5f);
 
       int hori = (tx + 2) / 4 - 1; // Convert from (tx,y,angle) to bins
       float horf = (tx - 1.5f) / 4.0f - hori;
@@ -957,8 +959,8 @@ __global__ void LaplaceMultiMem(const DetectorConfigDevice *cfg, float *d_Image,
 }
 
 __global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
-                             float *d_Result, int width, int pitch,
-                             int height) {
+                             float *d_Result, int width, int pitch_src,
+                             int pitch_res, int height) {
   __shared__ float xrows[16][32];
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
@@ -971,7 +973,7 @@ __global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
   for (int l = -8; l < 4; l += 4) {
     int ly = l + ty;
     int yl = max(min(yp + l + 4, height - 1), 0);
-    float val = d_Image[yl * pitch + xl];
+    float val = d_Image[yl * pitch_src + xl];
     val = k[4] * ShiftDown(val, 4) +
           k[3] * (ShiftDown(val, 5) + ShiftDown(val, 3)) +
           k[2] * (ShiftDown(val, 6) + ShiftDown(val, 2)) +
@@ -984,7 +986,7 @@ __global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
   for (int l = 4; l < LOWPASS_H; l += 4) {
     int ly = l + ty;
     int yl = min(yp + l + 4, height - 1);
-    float val = d_Image[yl * pitch + xl];
+    float val = d_Image[yl * pitch_src + xl];
     val = k[4] * ShiftDown(val, 4) +
           k[3] * (ShiftDown(val, 5) + ShiftDown(val, 3)) +
           k[2] * (ShiftDown(val, 6) + ShiftDown(val, 2)) +
@@ -993,7 +995,7 @@ __global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
     xrows[(ly + 8) % N][tx] = val;
     int ys = yp + l - 4;
     if (xp < width && ys < height && tx < LOWPASS_W)
-      d_Result[ys * pitch + xp] =
+      d_Result[ys * pitch_res + xp] =
           k[4] * xrows[(ly + 0) % N][tx] +
           k[3] * (xrows[(ly - 1) % N][tx] + xrows[(ly + 1) % N][tx]) +
           k[2] * (xrows[(ly - 2) % N][tx] + xrows[(ly + 2) % N][tx]) +
@@ -1004,7 +1006,7 @@ __global__ void LowPassBlock(const DetectorConfigDevice *cfg, float *d_Image,
   int ly = LOWPASS_H + ty;
   int ys = yp + LOWPASS_H - 4;
   if (xp < width && ys < height && tx < LOWPASS_W)
-    d_Result[ys * pitch + xp] =
+    d_Result[ys * pitch_res + xp] =
         k[4] * xrows[(ly + 0) % N][tx] +
         k[3] * (xrows[(ly - 1) % N][tx] + xrows[(ly + 1) % N][tx]) +
         k[2] * (xrows[(ly - 2) % N][tx] + xrows[(ly + 2) % N][tx]) +

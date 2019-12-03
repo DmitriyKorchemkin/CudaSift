@@ -25,7 +25,6 @@ public:
   double Download();
   double Readback();
   double InitTexture();
-  double CopyToTexture(CudaImage &dst, bool host);
 };
 
 int iDivUp(int a, int b);

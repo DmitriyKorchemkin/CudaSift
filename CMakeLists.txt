@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 2.6)
 project(cudaSift LANGUAGES CUDA CXX)
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include(GetGitRevisionDescription)
 git_describe(VERSION --tags)# --dirty=d)
 
@@ -19,7 +22,9 @@ set(CPACK_GENERATOR "TGZ")
 include(CPack)
 
 
+find_package(Turbojpeg REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(CUDALibs REQUIRED)
 
 include(GNUInstallDirs)
 

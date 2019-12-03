@@ -37,7 +37,6 @@ int main(int argc, char **argv) {
     cv::imread("data/img1.png", 0).convertTo(limg, CV_32FC1);
     cv::imread("data/img2.png", 0).convertTo(rimg, CV_32FC1);
   }
-  // cv::flip(limg, rimg, -1);
   unsigned int w = limg.cols;
   unsigned int h = limg.rows;
   std::cout << "Image size = (" << w << "," << h << ")" << std::endl;
@@ -45,11 +44,6 @@ int main(int argc, char **argv) {
   // Initial Cuda images and download images to device
   std::cout << "Initializing data..." << std::endl;
   InitCuda(devNum);
-  CudaImage img1, img2;
-  img1.Allocate(w, h, iAlignUp(w, 128), false, NULL, (float *)limg.data);
-  img2.Allocate(w, h, iAlignUp(w, 128), false, NULL, (float *)rimg.data);
-  img1.Download();
-  img2.Download();
 
   int nDevice;
   cudaGetDeviceCount(&nDevice);
@@ -65,7 +59,7 @@ int main(int argc, char **argv) {
   for (int d = 0; d < nDevice; ++d) {
     cudaSetDevice(d);
     for (int i = 0; i < nStream; ++i) {
-      InitSiftData(siftData[idx], 32768, true, true);
+      siftData[idx].allocate(32768, true, true, d);
       cudaStreamCreate(&streams[idx]);
       detectors[idx] =
           std::make_unique<SiftDetectorImpl>(SiftParams(), d, streams[idx]);
@@ -104,7 +98,6 @@ int main(int argc, char **argv) {
   std::cout << "Detected SIFT features on " << nDetectors * N << " images in "
             << diffD.count() << " second (" << (nDetectors * N) / diffD.count()
             << "FPS)" << std::endl;
-  return 0;
 
   // Match Sift features and find a homography
   cudaSetDevice(0);
@@ -131,6 +124,5 @@ int main(int argc, char **argv) {
   std::cout << "Match: [" << med << " -" << (med - match[0.0005 * N]) << " +"
             << (match[0.9995 * N] - med) << "]" << std::endl;
 
-  FreeSiftData(siftData[0]);
-  FreeSiftData(siftData[1]);
+  return 0;
 }

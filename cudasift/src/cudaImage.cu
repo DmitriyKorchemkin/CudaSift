@@ -92,30 +92,5 @@ double CudaImage::InitTexture() {
   return gpuTime;
 }
 
-double CudaImage::CopyToTexture(CudaImage &dst, bool host) {
-  if (dst.t_data == NULL) {
-    printf("Error CopyToTexture: No texture data\n");
-    return 0.0;
-  }
-  if ((!host || h_data == NULL) && (host || d_data == NULL)) {
-    printf("Error CopyToTexture: No source data\n");
-    return 0.0;
-  }
-  TimerGPU timer(0);
-  if (host)
-    safeCall(cudaMemcpy2DToArray((cudaArray *)dst.t_data, 0, 0, h_data, pitch,
-                                 dst.width * sizeof(float), dst.height,
-                                 cudaMemcpyHostToDevice));
-  else
-    safeCall(cudaMemcpy2DToArray((cudaArray *)dst.t_data, 0, 0, d_data, pitch,
-                                 dst.width * sizeof(float), dst.height,
-                                 cudaMemcpyDeviceToDevice));
-  safeCall(cudaDeviceSynchronize());
-  double gpuTime = timer.read();
-#ifdef VERBOSE
-  printf("CopyToTexture time =          %.2f ms\n", gpuTime);
-#endif
-  return gpuTime;
-}
 
 } // namespace cudasift

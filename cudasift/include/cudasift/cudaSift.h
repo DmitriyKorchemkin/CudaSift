@@ -5,46 +5,37 @@
 #include "cudasift/cudaImage.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
+#include <mutex>
 
 namespace cudasift {
 
-typedef struct {
-  float xpos;
-  float ypos;
-  float scale;
-  float sharpness;
-  float edgeness;
-  float orientation;
-  float score;
-  float ambiguity;
-  int match;
-  float match_xpos;
-  float match_ypos;
-  float match_error;
-  float subsampling;
-  float empty[3];
-  float data[128];
-} SiftPoint;
-
-typedef struct {
+struct SiftData {
   int numPts; // Number of available Sift points
   int maxPts; // Number of allocated Sift points
-#ifdef MANAGEDMEM
-  SiftPoint *m_data; // Managed data
-#else
-  SiftPoint *h_data; // Host (CPU) data
-  SiftPoint *d_data; // Device (GPU) data
-#endif
 
-} SiftData;
+  SiftData(const int maxPts = 0);
+  SiftData(SiftData &&other);
+  ~SiftData();
+  void allocate(int num = 32768, bool host = false, bool dev = true,
+                int device = 0);
+  SiftPoint *hostPtr();
+  void transferAsync(bool toHost, void *stream);
+  void transfer(bool toHost, void *stream, bool sync);
+  int deviceId = -1;
+#ifdef MANAGEDMEM
+  SiftPoint *m_data = nullptr; // Managed data
+#else
+  SiftPoint *h_data = nullptr; // Host (CPU) data
+  SiftPoint *d_data = nullptr; // Device (GPU) data
+#endif
+private:
+  SiftData(const SiftData &) = delete;
+};
 
 void InitCuda(int devNum = 0);
 float *AllocSiftTempMemory(int width, int height, int numOctaves,
                            bool scaleUp = false);
 void FreeSiftTempMemory(float *memoryTmp);
-void InitSiftData(SiftData &data, int num = 1024, bool host = false,
-                  bool dev = true);
-void FreeSiftData(SiftData &data);
 void PrintSiftData(SiftData &data);
 double MatchSiftData(SiftData &data1, SiftData &data2);
 
@@ -81,11 +72,12 @@ private:
 };
 
 struct SiftDetectorImpl {
+  static const int MIN_ALIGNMENT = 128;
   SiftDetectorImpl(const SiftParams &params = SiftParams(), int device = 0,
                    cudaStream_t stream = nullptr);
 
   ~SiftDetectorImpl();
-  void ExtractSift(SiftData &siftData, CudaImage &img);
+  void ExtractSift(SiftData &siftData, CudaImage &img, bool sync = true);
 
 private:
   double ScaleDown(CudaImage &res, CudaImage &src, float variance);

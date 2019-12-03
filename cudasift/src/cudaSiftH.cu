@@ -37,33 +37,32 @@ void InitCuda(int devNum) {
          2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / 1.0e6);
 }
 
-float *AllocSiftTempMemory(int width, int height, int numOctaves,
-                           bool scaleUp) {
-  TimerGPU timer(0);
-  const int nd = NUM_SCALES + 3;
-  int w = width * (scaleUp ? 2 : 1);
-  int h = height * (scaleUp ? 2 : 1);
-  int p = iAlignUp(w, 128);
-  int size = h * p;         // image sizes
-  int sizeTmp = nd * h * p; // laplace buffer sizes
-  for (int i = 0; i < numOctaves; i++) {
-    w /= 2;
-    h /= 2;
-    int p = iAlignUp(w, 128);
-    size += h * p;
-    sizeTmp += nd * h * p;
-  }
-  float *memoryTmp = NULL;
-  size_t pitch;
-  size += sizeTmp;
-  safeCall(cudaMallocPitch((void **)&memoryTmp, &pitch, (size_t)4096,
-                           (size + 4095) / 4096 * sizeof(float)));
-#ifdef VERBOSE
-  printf("Allocated memory size: %d bytes\n", size);
-  printf("Memory allocation time =      %.2f ms\n\n", timer.read());
+SiftData::~SiftData() {
+  safeCall(cudaSetDevice(deviceId));
+#ifdef MANAGEDMEM
+  safeCall(cudaFree(m_data));
+#else
+  if (d_data != NULL)
+    safeCall(cudaFree(d_data));
+  d_data = NULL;
+  if (h_data != NULL)
+    safeCall(cudaFreeHost(h_data));
 #endif
-  return memoryTmp;
+  numPts = 0;
+  maxPts = 0;
 }
+
+SiftData::SiftData(SiftData &&other) {
+  std::swap(maxPts, other.maxPts);
+#ifdef MANAGEDMEM
+  std::swap(m_data, other.m_data);
+#else
+  std::swap(h_data, other.h_data);
+  std::swap(d_data, other.d_data);
+#endif
+}
+
+SiftData::SiftData(const int maxPts) : maxPts(maxPts) {}
 
 void FreeSiftTempMemory(float *memoryTmp) {
   if (memoryTmp)
@@ -96,12 +95,14 @@ SiftDetectorImpl::SiftDetectorImpl(const SiftParams &params, int device,
   safeCall(cudaMemcpyAsync(p_normalizer_d, &normalizer_d,
                            sizeof(DescriptorNormalizerData),
                            cudaMemcpyHostToDevice, stream));
-  safeCall(cudaMemcpyAsync(
-      normalizer_d.normalizer_steps, normalizer_h.normalizer_steps,
-      sizeof(int) * normalizer_h.n_steps, cudaMemcpyHostToDevice, stream));
-  safeCall(cudaMemcpyAsync(normalizer_d.data, normalizer_h.data,
-                           sizeof(float) * normalizer_h.n_data,
+  safeCall(cudaMemcpyAsync(const_cast<int *>(normalizer_d.normalizer_steps),
+                           normalizer_h.normalizer_steps,
+                           sizeof(int) * normalizer_h.n_steps,
                            cudaMemcpyHostToDevice, stream));
+  safeCall(cudaMemcpyAsync(
+      const_cast<float *>(normalizer_d.data), normalizer_h.data,
+      sizeof(float) * normalizer_h.n_data, cudaMemcpyHostToDevice, stream));
+  cudaStreamSynchronize(stream);
   checkMsg("Normalizer allocation failed\n");
 }
 
@@ -110,9 +111,45 @@ SiftDetectorImpl::~SiftDetectorImpl() {
   safeCall(cudaFree(p_normalizer_d));
 }
 
-void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img) {
+SiftPoint *SiftData::hostPtr() {
+#ifdef MANAGEDMEM
+  return m_data;
+#else
+  return h_data;
+#endif
+}
+
+void SiftData::transferAsync(bool toHost, void *stream) {
+#ifndef MANAGEDMEM
+  if (toHost) {
+    safeCall(cudaMemcpyAsync(h_data, d_data, numPts * sizeof(SiftPoint),
+                             cudaMemcpyDeviceToHost, (cudaStream_t)stream));
+  } else {
+    safeCall(cudaMemcpyAsync(d_data, h_data, numPts * sizeof(SiftPoint),
+                             cudaMemcpyHostToDevice, (cudaStream_t)stream));
+  }
+#endif
+}
+
+void SiftData::transfer(bool toHost, void *stream, bool sync) {
+#ifndef MANAGEDMEM
+  if (toHost) {
+    safeCall(cudaMemcpyAsync(h_data, d_data, numPts * sizeof(SiftPoint),
+                             cudaMemcpyDeviceToHost, (cudaStream_t)stream));
+  } else {
+    safeCall(cudaMemcpyAsync(d_data, h_data, numPts * sizeof(SiftPoint),
+                             cudaMemcpyHostToDevice, (cudaStream_t)stream));
+  }
+#endif
+  if (sync) {
+    safeCall(cudaStreamSynchronize((cudaStream_t)stream));
+  }
+}
+
+void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img,
+                                   bool syncOnTransfer) {
   cudaSetDevice(device);
-  TimerGPU timer(0);
+  TimerGPU timer(stream);
   const int nd = NUM_SCALES + 3;
   int w = img.width * (params.scaleUp ? 2 : 1);
   int h = img.height * (params.scaleUp ? 2 : 1);
@@ -129,17 +166,20 @@ void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img) {
   }
   size += sizeTmp;
   if (!memoryTmp || memoryAlloc < size) {
+
     FreeSiftTempMemory(memoryTmp);
     size_t pitch;
     safeCall(cudaMallocPitch((void **)&memoryTmp, &pitch, (size_t)4096,
                              (size + 4095) / 4096 * sizeof(float)));
     memoryAlloc = size;
 
-#if 1 // def VERBOSE
+#ifdef VERBOSE
     printf("Allocated memory size: %d bytes\n", size);
     printf("Memory allocation time =      %.2f ms\n\n", timer.read());
 #endif
   }
+
+  // memoryAlloc << std::endl;
   float *memorySub = memoryTmp + sizeTmp;
   safeCall(cudaMemsetAsync(configHost.pointCounter, 0x0,
                            sizeof(uint32_t) * (8 * 2 + 1), stream));
@@ -147,21 +187,24 @@ void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img) {
 
   if (!params.scaleUp) {
     LowPass(lowImg, img, max(params.initBlur, 0.001f));
-    TimerGPU timer1(0);
+    TimerGPU timer1(stream);
     ExtractSiftLoop(siftData, lowImg, params.numOctaves, 0.0f,
                     params.lowestScale, 1.0f,
                     memorySub + height * iAlignUp(width, 128));
     safeCall(cudaMemcpyAsync(&siftData.numPts,
                              &configHost.pointCounter[2 * params.numOctaves],
                              sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    safeCall(cudaStreamSynchronize(stream));
     siftData.numPts =
         (siftData.numPts < siftData.maxPts ? siftData.numPts : siftData.maxPts);
+#ifdef VERBOSE
     printf("SIFT extraction time =        %.2f ms %d\n", timer1.read(),
            siftData.numPts);
+#endif
   } else {
     CudaImage upImg;
     upImg.Allocate(width, height, iAlignUp(width, 128), false, memoryTmp);
-    TimerGPU timer1(0);
+    TimerGPU timer1(stream);
     ScaleUp(upImg, img);
     LowPass(lowImg, upImg, max(params.initBlur, 0.001f));
     ExtractSiftLoop(siftData, lowImg, params.numOctaves, 0.0f,
@@ -170,23 +213,21 @@ void SiftDetectorImpl::ExtractSift(SiftData &siftData, CudaImage &img) {
     safeCall(cudaMemcpyAsync(&siftData.numPts,
                              &configHost.pointCounter[2 * params.numOctaves],
                              sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    safeCall(cudaStreamSynchronize(stream));
     siftData.numPts =
         (siftData.numPts < siftData.maxPts ? siftData.numPts : siftData.maxPts);
     RescalePositions(siftData, 0.5f);
+#ifdef VERBOSE
     printf("SIFT extraction time =        %.2f ms\n", timer1.read());
+#endif
   }
 
-#ifdef MANAGEDMEM
-  safeCall(cudaStreamSynchronize(stream));
-#else
-  if (siftData.h_data)
-    safeCall(cudaMemcpyAsync(siftData.h_data, siftData.d_data,
-                             sizeof(SiftPoint) * siftData.numPts,
-                             cudaMemcpyDeviceToHost, stream));
-#endif
+  siftData.transfer(true, stream, syncOnTransfer);
   double totTime = timer.read();
+#ifdef VERBOSE
   printf("Incl prefiltering & memcpy =  %.2f ms %d\n\n", totTime,
          siftData.numPts);
+#endif
 }
 
 int SiftDetectorImpl::ExtractSiftLoop(SiftData &siftData, CudaImage &img,
@@ -194,7 +235,7 @@ int SiftDetectorImpl::ExtractSiftLoop(SiftData &siftData, CudaImage &img,
                                       float lowestScale, float subsampling,
                                       float *memorySub) {
 #ifdef VERBOSE
-  TimerGPU timer(0);
+  TimerGPU timer(stream);
 #endif
   int w = img.width;
   int h = img.height;
@@ -229,8 +270,11 @@ void SiftDetectorImpl::ExtractSiftOctave(SiftData &siftData, CudaImage &img,
   int w = img.width;
   int h = img.height;
   int p = iAlignUp(w, 128);
-  for (int i = 0; i < nd - 1; i++)
+  for (int i = 0; i < nd - 1; i++) {
     diffImg[i].Allocate(w, h, p, false, memoryTmp + i * p * h);
+
+    //    memoryTmp<< "..." << memoryTmp+(i+1)*p*h-memoryTmp << std::endl;
+  }
 
   // Specify texture
   struct cudaResourceDesc resDesc;
@@ -258,16 +302,21 @@ void SiftDetectorImpl::ExtractSiftOctave(SiftData &siftData, CudaImage &img,
 #endif
   float baseBlur = pow(2.0f, -1.0f / NUM_SCALES);
   float diffScale = pow(2.0f, 1.0f / NUM_SCALES);
+
   LaplaceMulti(texObj, img, diffImg, octave);
+
   FindPointsMulti(diffImg, siftData, 10.0f, 1.0f / NUM_SCALES,
                   lowestScale / subsampling, subsampling, octave);
 #ifdef VERBOSE
   double gpuTimeDoG = timer1.read();
   TimerGPU timer4;
 #endif
+
   ComputeOrientations(texObj, img, siftData, octave);
+
   ExtractSiftDescriptors(texObj, siftData, subsampling, octave);
 
+  ;
   safeCall(cudaDestroyTextureObject(texObj));
 #ifdef VERBOSE
   double gpuTimeSift = timer4.read();
@@ -284,34 +333,23 @@ void SiftDetectorImpl::ExtractSiftOctave(SiftData &siftData, CudaImage &img,
 #endif
 }
 
-void InitSiftData(SiftData &data, int num, bool host, bool dev) {
-  data.numPts = 0;
-  data.maxPts = num;
+void SiftData::allocate(int num, bool host, bool dev, int device) {
+  numPts = 0;
+  maxPts = num;
   int sz = sizeof(SiftPoint) * num;
+  cudaSetDevice(device);
+  deviceId = device;
 #ifdef MANAGEDMEM
-  safeCall(cudaMallocManaged((void **)&data.m_data, sz));
+  safeCall(cudaMallocManaged((void **)&m_data, sz));
 #else
-  data.h_data = NULL;
+  h_data = NULL;
   if (host)
-    safeCall(cudaHostAlloc((void **)&data.h_data, sz, cudaHostAllocPortable));
-  data.d_data = NULL;
-  if (dev)
-    safeCall(cudaMalloc((void **)&data.d_data, sz));
+    safeCall(cudaHostAlloc((void **)&h_data, sz, cudaHostAllocPortable));
+  d_data = NULL;
+  if (dev) {
+    safeCall(cudaMalloc((void **)&d_data, sz));
+  }
 #endif
-}
-
-void FreeSiftData(SiftData &data) {
-#ifdef MANAGEDMEM
-  safeCall(cudaFree(data.m_data));
-#else
-  if (data.d_data != NULL)
-    safeCall(cudaFree(data.d_data));
-  data.d_data = NULL;
-  if (data.h_data != NULL)
-    safeCall(cudaFreeHost(data.h_data));
-#endif
-  data.numPts = 0;
-  data.maxPts = 0;
 }
 
 void PrintSiftData(SiftData &data) {
@@ -382,6 +420,7 @@ double SiftDetectorImpl::ScaleDown(CudaImage &res, CudaImage &src,
       configHost.dev, res.d_data, src.d_data, src.width, src.pitch, src.height,
       res.pitch);
 
+  cudaStreamSynchronize(stream);
   checkMsg("ScaleDown() execution failed\n");
   return 0.0;
 }
@@ -395,6 +434,7 @@ double SiftDetectorImpl::ScaleUp(CudaImage &res, CudaImage &src) {
   dim3 threads(SCALEUP_W / 2, SCALEUP_H / 2);
   cudasift::ScaleUp<<<blocks, threads, 0, stream>>>(
       res.d_data, src.d_data, src.width, src.pitch, src.height, res.pitch);
+  cudaStreamSynchronize(stream);
   checkMsg("ScaleUp() execution failed\n");
   return 0.0;
 }
@@ -411,6 +451,7 @@ double SiftDetectorImpl::ComputeOrientations(cudaTextureObject_t texObj,
   ComputeOrientationsCONST<<<blocks, threads, 0, stream>>>(
       configHost.dev, texObj, siftData.d_data, octave);
 #endif
+  cudaStreamSynchronize(stream);
   checkMsg("ComputeOrientations() execution failed\n");
   return 0.0;
 }
@@ -429,6 +470,7 @@ double SiftDetectorImpl::ExtractSiftDescriptors(cudaTextureObject_t texObj,
       configHost.dev, texObj, siftData.d_data, p_normalizer_d, subsampling,
       octave);
 #endif
+  cudaStreamSynchronize(stream);
   checkMsg("ExtractSiftDescriptors() execution failed\n");
   return 0.0;
 }
@@ -438,6 +480,7 @@ double SiftDetectorImpl::RescalePositions(SiftData &siftData, float scale) {
   dim3 threads(64);
   cudasift::RescalePositions<<<blocks, threads, 0, stream>>>(
       siftData.d_data, siftData.numPts, scale);
+  cudaStreamSynchronize(stream);
   checkMsg("RescapePositions() execution failed\n");
   return 0.0;
 }
@@ -459,13 +502,16 @@ double SiftDetectorImpl::LowPass(CudaImage &res, CudaImage &src, float scale) {
     configHost.oldScaleLowPass = scale;
   }
   int width = res.width;
-  int pitch = res.pitch;
+  int pitch_res = res.pitch;
+  int pitch_src = src.pitch;
   int height = res.height;
   dim3 blocks(iDivUp(width, LOWPASS_W), iDivUp(height, LOWPASS_H));
 
   dim3 threads(LOWPASS_W + 2 * LOWPASS_R, 4);
-  LowPassBlock<<<blocks, threads, 0, stream>>>(
-      configHost.dev, src.d_data, res.d_data, width, pitch, height);
+  LowPassBlock<<<blocks, threads, 0, stream>>>(configHost.dev, src.d_data,
+                                               res.d_data, width, pitch_src,
+                                               pitch_res, height);
+  cudaStreamSynchronize(stream);
   checkMsg("LowPass() execution failed\n");
   return 0.0;
 }
@@ -506,6 +552,7 @@ double SiftDetectorImpl::LaplaceMulti(cudaTextureObject_t texObj,
   LaplaceMultiMem<<<blocks, threads, 0, stream>>>(
       configHost.dev, baseImage.d_data, results[0].d_data, width, pitch, height,
       octave);
+  cudaStreamSynchronize(stream);
   checkMsg("LaplaceMulti() execution failed\n");
   return 0.0;
 }
@@ -529,10 +576,12 @@ double SiftDetectorImpl::FindPointsMulti(CudaImage *sources, SiftData &siftData,
       configHost.dev, sources->d_data, siftData.m_data, w, p, h, subsampling,
       lowestScale, params.threshold, factor, edgeLimit, octave);
 #else
+
   FindPointsMultiNew<<<blocks, threads, 0, stream>>>(
       configHost.dev, sources->d_data, siftData.d_data, w, p, h, subsampling,
       lowestScale, params.threshold, factor, edgeLimit, octave);
 #endif
+  cudaStreamSynchronize(stream);
   checkMsg("FindPointsMulti() execution failed\n");
   return 0.0;
 }
