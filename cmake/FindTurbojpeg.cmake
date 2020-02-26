@@ -16,11 +16,14 @@ if (NOT TurboJpeg_COMPILES)
     message(FATAL_ERROR "Failed to compile sample turbojpeg code")
 else()
     message(STATUS "Found working turbojpeg at ${TurboJpeg_INCLUDE_DIR}")
-    add_library(turbojpeg::turbojpeg STATIC IMPORTED)
-    set_target_properties(turbojpeg::turbojpeg PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES ${Turbojpeg_INCLUDE_DIR}
-        IMPORTED_LOCATION ${Turbojpeg_LIBRARY})
+    if (NOT TARGET turbojpeg::turbojpeg)
+      add_library(turbojpeg::turbojpeg STATIC IMPORTED)
+      set_target_properties(turbojpeg::turbojpeg PROPERTIES
+          INTERFACE_INCLUDE_DIRECTORIES ${Turbojpeg_INCLUDE_DIR}
+          IMPORTED_LOCATION ${Turbojpeg_LIBRARY})
+    endif()
 endif()
+mark_as_advanced(Turbojpeg_LIBRARY Turbojpeg_INCLUDE_DIR)
 
 unset(CMAKE_REQUIRED_INCLUDES)
 unset(CMAKE_REQUIRED_LIBRARIES)

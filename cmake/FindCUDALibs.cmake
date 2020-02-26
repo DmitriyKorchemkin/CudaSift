@@ -20,7 +20,7 @@ list(APPEND CUDALibs_HINTS "${CUDA_TOOLKIT_ROOT_DIR}")
 function(find_and_add_cuda_import_lib lib_name)
   string(TOUPPER ${lib_name} LIB_NAME)
   find_library(CUDA_${LIB_NAME} ${lib_name} HINTS ${CUDALibs_HINTS})
-  if (NOT CUDA_${LIB_NAME} STREQUAL CUDA_${LIB_NAME}-NOTFOUND)
+  if (NOT CUDA_${LIB_NAME} STREQUAL CUDA_${LIB_NAME}-NOTFOUND AND NOT TARGET CUDA::${lib_name})
     add_library(CUDA::${lib_name} IMPORTED INTERFACE)
     set_target_properties(CUDA::${lib_name}
       PROPERTIES
